@@ -1,83 +1,77 @@
 ---
 name: picklebet-missing-ids
 description: >-
-  Run the Picklebet missing consumer fixture ID workflow for a Jira issue
-  that is Under investigation or Reopened. Use when automation rule
-  019f45bf-fbf0-7bbf-b180-ae122b0714ac fires, or when asked to find a
-  consumer fixture, update it in Sportcast, set match state, or resolve
-  the Jira ticket.
+  Handle Picklebet "SGM Request" / Sportcast > Repush SGM tickets in the TSD
+  Jira project: read the Sportcast fixture ids from the description, check
+  each fixture in Sportcast, add a missing Betradar consumer id, republish,
+  confirm SinglesCreated reached Picklebet production, and resolve the
+  ticket. Use when Jira automation rule 019f45bf-fbf0-7bbf-b180-ae122b0714ac
+  fires, or when asked to investigate, repush, or resolve one of these tickets.
 ---
 
-# Picklebet Missing Consumer Fixture IDs
+# Picklebet SGM repush / missing consumer fixture ids
 
-Triggered by the Jira automation rule `019f45bf-fbf0-7bbf-b180-ae122b0714ac`.
+Everything runs through one command. Do not call Sportcast, Datadog, or Jira by hand, and do not build URLs.
 
-The tested helpers live in `picklebet_missing_ids.workflow`. Use them for search terms, request bodies, confirmation checks, and Jira plans. Do not hand-build Sportcast URLs.
+```bash
+python3 -m picklebet_missing_ids <ISSUE_KEY> --issue-json /tmp/issue.json [--apply]
+```
 
-## Confirmation
+## 1. Get the issue payload
 
-- That automation rule is confirmation to run the branch that matches the issue status.
-- Any other request needs a clear yes before a Sportcast write or a Jira transition.
-- Pass `confirm=True` only after that confirmation. Without it, mutating functions raise `ConfirmationRequired` and make no HTTP call.
+- If `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` are set, omit `--issue-json`. The tool fetches the issue.
+- Otherwise write the Jira trigger payload to `/tmp/issue.json`. Include `key`, `summary`, `status`, `description`, the Category, the Operator/s (TSD) field (`customfield_11360`), Organizations, and comments with author email. Either the Jira REST shape (`{"key", "fields": {...}}`) or a flat object works.
 
-## Runtime configuration
+The fixtures come from the **description**, one block per line like this:
 
-Read these from the environment or the Jira issue at runtime. Do not write them into the repo, logs, comments, or error output.
+```text
+Sportcast Fixture ID: 551738
+Client Fixture ID: sr:match:73220788
+Fixture Info: Martinique v El Salvador
+```
 
-| Name | Role |
-| --- | --- |
-| `SPORTCAST_AU_BASE` | HTTPS base for the consumer-fixture update |
-| `SPORTCAST_INTERNAL_BASE` | HTTPS base for match state |
-| `SPORTCAST_ACCOUNT_KEY` | Outer match-state `Key`, when it differs from the issue |
-| Issue field `apiKey` | Item `Key`, and the outer `Key` when the account env var is unset |
+These tickets have no `client_fixture_id`, `FixtureId`, `apiKey`, or `feedProviders` fields. Do not look for them.
 
-If a base URL is unset, stop and say which variable is missing. Do not guess a host.
+## 2. Decide whether to pass `--apply`
 
-## Fields
+- When triggered by the Jira rule above, pass `--apply`. The rule is the confirmation.
+- When a person asks in chat, run without `--apply` first, show the output, and pass `--apply` only after a clear yes.
 
-From the Jira issue, via Atlassian `jira_get_issue` (authenticate the Atlassian MCP first if it is not already signed in):
+The tool still refuses to write, even with `--apply`, when:
+- the summary says it is a test ("do not touch", "for test purposes"),
+- any fixture has kicked off or is in play,
+- the ticket's teams differ from Sportcast's,
+- Sportcast already has a different Betradar id (adding one would remove it from another fixture),
+- the client is not following Betbuilder on the fixture,
+- the client fixture id is not a Betradar `sr:match:` id,
+- the category is not a Repush SGM / SGM request.
 
-- `client_fixture_id` — Picklebet fixture ID
-- `FixtureId` — Sportcast fixture ID
-- `apiKey` — Sportcast API key
-- `feedProviders` — boolean
+## 3. What `--apply` does (only when every fixture passes)
 
-Pass the issue payload and, when the values sit on `customfield_*` ids, the id-to-name map into `extract_custom_fields`. Log `redacted_fields` only.
+1. Adds the Betradar consumer id (source 4) where it is missing, then reads it back.
+2. Republishes each fixture (`isRepublish=true`).
+3. Polls Datadog for up to 3 minutes for `SinglesCreated` with HTTP 200 to Picklebet production. Staging, dev, and t1 endpoints are ignored.
+4. If every fixture was delivered: comments to the customer, sets Incident Resolution = Workaround Applied and Resolution Notes, and transitions the ticket to **Resolved**. Without Jira credentials it prints the plan instead.
 
-## Branch: Under investigation
+If delivery is not seen, the ticket stays Under investigation and the output says which fixture is missing.
 
-1. `extract_custom_fields`.
-2. `consumer_search_term(client_fixture_id, feedProviders)`.
-   - `feedProviders` true: the client fixture id itself.
-   - `feedProviders` false: `sr:match:{client_fixture_id}` unless it already has that prefix.
-3. Search Sportcast with that term and take `resolvedFixtureId`. The sportcast MCP is the search path. On failure, widen the time window, drop filters, and try at most about three different searches. If search is still unavailable, stop. Do not invent a search URL.
-4. Require both `FixtureId` and `resolvedFixtureId` before any write.
-5. `update_consumer_fixture_id(FixtureId, resolvedFixtureId, confirm=True)`. This GETs `/api/UpdateConsumerFixtureid` and expects HTTP 200.
-6. `set_match_state(..., match_state=1, confirm=True)`.
-7. `wait_seconds(3)`.
-8. `set_match_state(..., match_state=2, confirm=True)`.
-9. Apply `transition_jira_resolved(issue_key)` through Jira:
-   - Incident Resolution = `Workaround Applied`
-   - Resolving Team = `Sportsbook Support`
-   - Comment: `Thanks for raising {issue_key}. Please check . If the issue persists please reopen the ticket.`
-   - Transition to Resolved.
+## 4. Reopened tickets
 
-`run_issue(..., status="Under investigation", confirm=True, search_fn=...)` performs steps 1–9's plan, including the three-second wait between match states. Applying the returned `jira` plan still goes through the Jira MCP.
+The tool reads the latest comment from a non-OpenBet author:
+- If it confirms the fix, the ticket is resolved with comment `Resolving`.
+- If it says the issue persists, or is unclear, the ticket goes back to Under investigation, assigned to OpenBet Support.
 
-Network errors retry once. Any other failure is logged without secrets and stops the write path.
+## 5. Reply
 
-## Branch: Reopened
+Post the command's stdout as the reply, unchanged. It carries a `[sgm-agent:...]` marker. If the output is `No change since the last run`, reply with only that line. Do not post the same findings again.
 
-1. Read the latest customer comment.
-2. Decide `OK` when the customer confirms it is resolved. Decide `NEEDS_REVIEW` when the issue persists or the comment is ambiguous. `analyze_reopen_comment` is the fallback and defaults to `NEEDS_REVIEW`.
-3. `OK`: comment `Resolving`, transition to Resolved with resolution `Fixed`, and set Incident Resolution to `Workaround Applied`.
-4. `NEEDS_REVIEW`: transition to Under investigation and assign `712020:e626a9d2-bf67-4741-a80b-3a018547cce4`.
+Never paste fixture JSON, cookies, or API keys. The fixture definition contains client API keys.
 
-`run_issue(..., status="Reopened", comment=..., confirm=True)` returns that plan. Apply it through Jira only after confirmation.
+## Settings
 
-## Branch: Fallback
+Names and which ones are required are in `.env.example`. Copy it to `.env` and fill in the values. `.env` is gitignored. On a Cursor cloud agent, add the same names as secrets in the cloud environment instead of committing them. The tool loads `.env` from the repo root and does not override variables that are already set.
 
-Any other status returns `{"action": "todo", "message": "todo"}`. Leave the issue for manual handling.
+If a setting is missing, the output says which one. Report that and stop. Do not try another path.
 
 ## Checks
 

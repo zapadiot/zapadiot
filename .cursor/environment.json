@@ -1,0 +1,3 @@
+{
+  "install": "python3 -m unittest picklebet_missing_ids.test_workflow"
+}

@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from picklebet_missing_ids import datadog, jira, sportcast
 from picklebet_missing_ids.ticket import parse_issue
@@ -33,7 +35,23 @@ def _load_issue(key: str, path: str | None) -> dict:
     )
 
 
+def _load_dotenv() -> None:
+    """Load repo-root .env without overriding variables already set."""
+    path = Path(__file__).resolve().parent.parent / ".env"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value.strip().strip("'\"")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _load_dotenv()
     parser = argparse.ArgumentParser(prog="picklebet_missing_ids")
     parser.add_argument("issue_key")
     parser.add_argument("--issue-json", help="Jira issue payload saved from the trigger")
