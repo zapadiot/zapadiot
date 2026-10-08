@@ -1,322 +1,299 @@
-"""Unit tests for the Picklebet missing consumer fixture workflow."""
+"""Tests for the Picklebet SGM repush workflow, modelled on TSD-388989 / TSD-389084."""
 
 from __future__ import annotations
 
 import json
-import os
 import unittest
-from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from datetime import datetime, timezone
 
+from picklebet_missing_ids.datadog import parse_deliveries
+from picklebet_missing_ids.ticket import parse_issue
 from picklebet_missing_ids.workflow import (
+    ADD_ID_AND_REPUBLISH,
     ASSIGNEE_ID,
-    AU_BASE_ENV,
-    INTERNAL_BASE_ENV,
-    ConfirmationRequired,
-    SportcastError,
-    WorkflowError,
+    CLIENT_NOT_FOLLOWING,
+    ID_MISMATCH,
+    KICKED_OFF,
+    REPUBLISH,
+    TEAMS_MISMATCH,
+    UNKNOWN_SOURCE,
     analyze_reopen_comment,
-    branch_for_status,
-    consumer_search_term,
-    extract_custom_fields,
-    match_state_payload,
-    redact,
-    run_issue,
-    set_match_state,
-    transition_jira_resolved,
-    update_consumer_fixture_id,
+    already_reported,
+    betradar_feed_id,
+    report,
+    run,
 )
 
-AU = "https://au.example.test"
-INTERNAL = "https://internal.example.test"
-API_KEY = "test-api-key-value"
-ACCOUNT_KEY = "test-account-key-value"
+BEFORE_KICKOFF = datetime(2026, 10, 5, 7, 0, tzinfo=timezone.utc)
+AFTER_KICKOFF = datetime(2026, 10, 8, 11, 0, tzinfo=timezone.utc)
+SECRET_KEY = "11111111-2222-3333-4444-555555555555"
+
+DESCRIPTION = """| |EXTERNAL| |
+
+Sportcast Fixture ID: 551738
+Client Fixture ID: sr:match:73220788
+Fixture Info: Martinique v El Salvador
+Sport Affected: Soccer
+Products Affected: Betbuilder
+
+Sportcast Fixture ID: 551736
+Client Fixture ID: sr:match:73220786
+Fixture Info: Guatemala v Suriname
+Sport Affected: Soccer
+Products Affected: Betbuilder
+"""
 
 
-def _issue(**overrides):
-    fields = {
-        "client_fixture_id": "998877",
-        "FixtureId": "445566",
-        "apiKey": API_KEY,
-        "feedProviders": False,
+def _issue(summary="Soccer SGM Request", status="Under investigation", comments=None, description=DESCRIPTION):
+    return {
+        "key": "TSD-388989",
+        "fields": {
+            "summary": summary,
+            "status": {"name": status},
+            "description": description,
+            "customfield_10651": {"value": "Sportcast", "child": {"value": "Repush SGM"}},
+            "customfield_11360": [{"objectId": "46193"}],
+            "customfield_10002": [{"name": "PickleBet"}],
+            "comment": {"comments": comments or []},
+        },
     }
-    fields.update(overrides)
-    return {"key": "PB-42", "fields": fields}
 
 
-class SearchAndFieldsTest(unittest.TestCase):
-    def test_feed_provider_search_uses_client_id(self) -> None:
-        self.assertEqual(consumer_search_term("998877", True), "998877")
-        self.assertEqual(consumer_search_term("998877", "true"), "998877")
-
-    def test_non_feed_provider_search_uses_sr_match(self) -> None:
-        self.assertEqual(consumer_search_term("998877", False), "sr:match:998877")
-        self.assertEqual(consumer_search_term("sr:match:998877", "no"), "sr:match:998877")
-
-    def test_missing_client_id_is_rejected(self) -> None:
-        with self.assertRaises(WorkflowError):
-            consumer_search_term("  ", False)
-
-    def test_extracts_named_custom_fields(self) -> None:
-        issue = {
-            "key": "PB-7",
-            "fields": {
-                "customfield_1": "111",
-                "customfield_2": "222",
-                "customfield_3": API_KEY,
-                "customfield_4": {"value": "true"},
-            },
-        }
-        names = {
-            "customfield_1": "client_fixture_id",
-            "customfield_2": "FixtureId",
-            "customfield_3": "apiKey",
-            "customfield_4": "feedProviders",
-        }
-        fields = extract_custom_fields(issue, names)
-        self.assertEqual(fields["client_fixture_id"], "111")
-        self.assertEqual(fields["FixtureId"], 222)
-        self.assertTrue(fields["feedProviders"])
-        self.assertNotIn(API_KEY, json.dumps({k: v for k, v in fields.items() if k != "apiKey"}))
-
-    def test_status_branches(self) -> None:
-        self.assertEqual(branch_for_status("Under investigation"), "under_investigation")
-        self.assertEqual(branch_for_status("Reopened"), "reopened")
-        self.assertEqual(branch_for_status("In Progress"), "fallback")
+def _definition(fixture_id, home, away, start, following=True, betradar=""):
+    consumer = [{"sourceName": "BetGenius", "consumerFixtureId": "14234050"}]
+    if betradar:
+        consumer.append({"sourceName": "BetRadar", "consumerFixtureId": betradar})
+    return {
+        "fixtureId": fixture_id,
+        "clientId": 1,
+        "homeTeam": {"team": {"name": home}},
+        "awayTeam": {"team": {"name": away}},
+        "isFixtureInplay": False,
+        "details": {
+            "startTimeUTC": start,
+            "consumerfixtureIdList": consumer,
+            "betBuilderClients": [
+                {"clientId": 244, "clientName": "Picklebet", "betBuilderFollowing": following,
+                 "lastPublished": "2026-10-05T06:32:47Z", "clientApiKey": SECRET_KEY},
+            ],
+        },
+    }
 
 
-class MutationGuardTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self._previous = {
-            AU_BASE_ENV: os.environ.get(AU_BASE_ENV),
-            INTERNAL_BASE_ENV: os.environ.get(INTERNAL_BASE_ENV),
-        }
-        os.environ[AU_BASE_ENV] = AU
-        os.environ[INTERNAL_BASE_ENV] = INTERNAL
+class FakeSportcast:
+    def __init__(self, definitions, betradar):
+        self.definitions = definitions
+        self.betradar = dict(betradar)
+        self.calls: list[tuple] = []
 
-    def tearDown(self) -> None:
-        for name, value in self._previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+    def get_fixture(self, fixture_id):
+        self.calls.append(("get", fixture_id))
+        return self.definitions.get(fixture_id, {})
 
-    def test_update_url_uses_configured_base_and_query(self) -> None:
-        from picklebet_missing_ids.workflow import update_consumer_fixture_url
+    def consumer_id(self, fixture_id, source="BetRadar"):
+        return self.betradar.get(fixture_id, "")
 
-        url = update_consumer_fixture_url(445566, "sr:match:998877")
-        parts = urlsplit(url)
-        self.assertEqual(f"{parts.scheme}://{parts.netloc}", AU)
-        self.assertEqual(parts.path, "/api/UpdateConsumerFixtureid")
-        self.assertEqual(
-            parse_qs(parts.query),
-            {"fixtureId": ["445566"], "consumerfixtureid": ["sr:match:998877"]},
-        )
-        self.assertNotIn(API_KEY, url)
+    def add_consumer_id(self, fixture_id, feed_id, source="BetRadar"):
+        self.calls.append(("add", fixture_id, feed_id))
+        self.betradar[fixture_id] = feed_id
+        return f"Added BetRadar Consumer Id {feed_id} for FixtureId {fixture_id}"
 
-    def test_missing_base_url_names_the_env_var_only(self) -> None:
-        os.environ.pop(AU_BASE_ENV)
-        from picklebet_missing_ids.workflow import update_consumer_fixture_url
-
-        with self.assertRaises(WorkflowError) as caught:
-            update_consumer_fixture_url(1, "abc")
-        self.assertIn(AU_BASE_ENV, str(caught.exception))
-        self.assertNotIn("https://", str(caught.exception))
-
-    def test_mutations_require_confirmation(self) -> None:
-        with self.assertRaises(ConfirmationRequired):
-            update_consumer_fixture_id(1, "abc", confirm=False, http_get=lambda url: 200)
-        with self.assertRaises(ConfirmationRequired):
-            set_match_state(1, API_KEY, 1, confirm=False, http_post=lambda url, body: 200)
-
-    def test_match_state_payload_redacts_in_errors(self) -> None:
-        def fail(url, body):
-            raise ConnectionError(json.dumps(body))
-
-        with self.assertRaises(SportcastError) as caught:
-            set_match_state(
-                445566,
-                API_KEY,
-                1,
-                confirm=True,
-                account_key=ACCOUNT_KEY,
-                http_post=fail,
-            )
-        message = str(caught.exception)
-        self.assertNotIn(API_KEY, message)
-        self.assertNotIn(ACCOUNT_KEY, message)
-        self.assertIn("[redacted]", message)
-
-    def test_non_200_is_an_error(self) -> None:
-        with self.assertRaises(SportcastError):
-            update_consumer_fixture_id(1, "abc", confirm=True, http_get=lambda url: 500)
-
-    def test_network_error_is_retried_once(self) -> None:
-        calls = {"count": 0}
-
-        def flaky(url, body):
-            calls["count"] += 1
-            if calls["count"] == 1:
-                raise ConnectionError("temporary")
-            return 200
-
-        response = set_match_state(10, API_KEY, 2, confirm=True, http_post=flaky)
-        self.assertEqual(response.status, 200)
-        self.assertEqual(calls["count"], 2)
-
-    def test_match_state_rejects_other_states(self) -> None:
-        with self.assertRaises(WorkflowError):
-            match_state_payload(1, API_KEY, 9)
+    def republish(self, definition):
+        self.calls.append(("publish", definition["fixtureId"]))
 
 
-class EndToEndTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self._previous = {
-            AU_BASE_ENV: os.environ.get(AU_BASE_ENV),
-            INTERNAL_BASE_ENV: os.environ.get(INTERNAL_BASE_ENV),
-        }
-        os.environ[AU_BASE_ENV] = AU
-        os.environ[INTERNAL_BASE_ENV] = INTERNAL
+def _tsd_388989_sportcast():
+    return FakeSportcast(
+        {
+            551738: _definition(551738, "Martinique", "El Salvador", "2026-10-05T22:00:00Z"),
+            551736: _definition(551736, "Guatemala", "Suriname", "2026-10-06T00:00:00Z",
+                                betradar="sr:match:73220786"),
+        },
+        {551736: "sr:match:73220786"},
+    )
 
-    def tearDown(self) -> None:
-        for name, value in self._previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
 
-    def test_under_investigation_updates_then_settles(self) -> None:
-        events: list[tuple] = []
+class TicketParsingTest(unittest.TestCase):
+    def test_reads_both_fixtures_from_description(self):
+        ticket = parse_issue(_issue())
+        self.assertEqual([f.fixture_id for f in ticket.fixtures], [551738, 551736])
+        self.assertEqual(ticket.fixtures[0].client_fixture_id, "sr:match:73220788")
+        self.assertEqual(ticket.fixtures[1].info, "Guatemala v Suriname")
+        self.assertEqual(ticket.client_name, "Picklebet")
+        self.assertEqual(ticket.category, "Sportcast > Repush SGM")
+        self.assertTrue(ticket.is_repush)
 
-        def search(term: str) -> str:
-            events.append(("search", term))
-            return "sr:match:998877"
+    def test_reads_html_description_and_flat_payload(self):
+        html = DESCRIPTION.replace("\n", "<br>")
+        flat = {"key": "TSD-1", "summary": "x", "status": "Reopened", "description": f"<p>{html}</p>"}
+        ticket = parse_issue(flat)
+        self.assertEqual(len(ticket.fixtures), 2)
+        self.assertEqual(ticket.status, "Reopened")
 
-        def http_get(url: str) -> int:
-            events.append(("get", url))
-            return 200
+    def test_reads_atlassian_document_format(self):
+        adf = {"type": "doc", "content": [{"type": "paragraph", "content": [
+            {"type": "text", "text": "Sportcast Fixture ID: 551738"}, {"type": "hardBreak"},
+            {"type": "text", "text": "Client Fixture ID: sr:match:73220788"}]}]}
+        ticket = parse_issue({"key": "TSD-2", "fields": {"description": adf, "status": {"name": "x"}}})
+        self.assertEqual(ticket.fixtures[0].client_fixture_id, "sr:match:73220788")
 
-        def http_post(url: str, body: dict) -> int:
-            events.append(("post", body["Items"][0]["MatchState"], body))
-            return 200
+    def test_clone_marked_do_not_touch_is_a_test(self):
+        ticket = parse_issue(_issue(summary="CLONE - Soccer SGM Request for test purposes please do not touch"))
+        self.assertTrue(ticket.is_test)
 
-        def sleep(seconds: float) -> None:
-            events.append(("sleep", seconds))
+    def test_betradar_feed_id(self):
+        self.assertEqual(betradar_feed_id("sr:match:73220788"), "sr:match:73220788")
+        self.assertEqual(betradar_feed_id("73220788"), "sr:match:73220788")
+        self.assertEqual(betradar_feed_id("0010c3cbb400000000000000"), "")
 
-        result = run_issue(
-            _issue(),
-            status="Under investigation",
-            confirm=True,
-            search_fn=search,
-            http_get=http_get,
-            http_post=http_post,
-            sleep=sleep,
-            account_key=ACCOUNT_KEY,
-        )
 
-        self.assertEqual(result["action"], "resolved")
-        self.assertEqual(result["searchTerm"], "sr:match:998877")
-        self.assertEqual(result["resolvedFixtureId"], "sr:match:998877")
-        self.assertEqual(result["matchStates"], [1, 2])
-        self.assertEqual(result["jira"]["transition"], "Resolved")
-        self.assertEqual(result["jira"]["fields"]["Incident Resolution"], "Workaround Applied")
-        self.assertEqual(result["jira"]["fields"]["Resolving Team"], "Sportsbook Support")
-        self.assertIn("PB-42", result["jira"]["comment"])
-        self.assertEqual(result["fields"]["apiKey"], "[redacted]")
-        self.assertEqual([event[0] for event in events], ["search", "get", "post", "sleep", "post"])
-        self.assertEqual(events[3], ("sleep", 3))
-        self.assertEqual(events[2][1], 1)
-        self.assertEqual(events[4][1], 2)
-        self.assertEqual(events[2][2]["Key"], ACCOUNT_KEY)
-        self.assertNotIn(API_KEY, json.dumps(result))
+class SuccessfulTrajectoryTest(unittest.TestCase):
+    def test_tsd_388989_adds_missing_id_republishes_verifies_and_resolves(self):
+        sportcast = _tsd_388989_sportcast()
+        verified = []
 
-    def test_feed_provider_true_searches_raw_client_id(self) -> None:
-        seen = {}
+        def verify(fixture_id, client, since):
+            verified.append((fixture_id, client, since))
+            return ["2026-10-05T07:09:21Z"]
 
-        def search(term: str) -> str:
-            seen["term"] = term
-            return "client-fixture"
+        result = run(parse_issue(_issue()), sportcast, apply=True, now=BEFORE_KICKOFF, verify=verify)
 
-        run_issue(
-            _issue(feedProviders=True, client_fixture_id="client-fixture"),
-            status="Under investigation",
-            confirm=True,
-            search_fn=search,
-            http_get=lambda url: 200,
-            http_post=lambda url, body: 200,
-            sleep=lambda seconds: None,
-        )
-        self.assertEqual(seen["term"], "client-fixture")
+        self.assertEqual([f.verdict for f in result.findings], [ADD_ID_AND_REPUBLISH, REPUBLISH])
+        self.assertIn(("add", 551738, "sr:match:73220788"), sportcast.calls)
+        self.assertNotIn(("add", 551736, "sr:match:73220786"), sportcast.calls)
+        self.assertEqual([c for c in sportcast.calls if c[0] == "publish"],
+                         [("publish", 551738), ("publish", 551736)])
+        self.assertEqual({v[1] for v in verified}, {"Picklebet"})
+        self.assertTrue(result.applied)
+        self.assertEqual(result.blockers, [])
+        self.assertEqual(result.jira["transition"], "Resolved")
+        self.assertEqual(result.jira["incident_resolution"], "Workaround Applied")
+        self.assertIn("Martinique v El Salvador (Sportcast 551738 / sr:match:73220788)", result.jira["comment"])
+        self.assertIn("Please reopen this ticket", result.jira["comment"])
+        self.assertIn("Mapped the missing Betradar consumer id", result.jira["resolution_notes"])
 
-    def test_unconfirmed_run_does_not_call_sportcast(self) -> None:
-        def boom(*_args, **_kwargs):
-            raise AssertionError("Sportcast was called without confirmation")
+    def test_dry_run_changes_nothing(self):
+        sportcast = _tsd_388989_sportcast()
+        result = run(parse_issue(_issue()), sportcast, apply=False, now=BEFORE_KICKOFF)
+        self.assertFalse(result.applied)
+        self.assertIsNone(result.jira)
+        self.assertEqual({c[0] for c in sportcast.calls}, {"get"})
 
-        with self.assertRaises(ConfirmationRequired):
-            run_issue(
-                _issue(),
-                status="Under investigation",
-                confirm=False,
-                search_fn=boom,
-                http_get=boom,
-                http_post=boom,
-            )
+    def test_no_resolve_without_delivery(self):
+        result = run(parse_issue(_issue()), _tsd_388989_sportcast(), apply=True, now=BEFORE_KICKOFF,
+                     verify=lambda *a: [], verify_timeout=30, poll_every=15, sleep=lambda s: None)
+        self.assertTrue(result.applied)
+        self.assertIsNone(result.jira)
+        self.assertIn("No production SinglesCreated delivery", " ".join(result.blockers))
 
-    def test_reopen_ok_resolves(self) -> None:
-        plan = run_issue(
-            _issue(),
-            status="Reopened",
-            confirm=True,
-            comment="Thanks, this is resolved now.",
-        )
-        self.assertEqual(plan["decision"], "OK")
-        self.assertEqual(plan["transition"], "Resolved")
-        self.assertEqual(plan["resolution"], "Fixed")
-        self.assertEqual(plan["comment"], "Resolving")
-        self.assertEqual(plan["fields"]["Incident Resolution"], "Workaround Applied")
+    def test_no_resolve_without_datadog(self):
+        result = run(parse_issue(_issue()), _tsd_388989_sportcast(), apply=True, now=BEFORE_KICKOFF)
+        self.assertTrue(result.applied)
+        self.assertIsNone(result.jira)
 
-    def test_reopen_ambiguous_assigns_investigation(self) -> None:
-        plan = run_issue(
-            _issue(),
-            status="Reopened",
-            confirm=True,
-            comment="Can someone look at this?",
-        )
-        self.assertEqual(plan["decision"], "NEEDS_REVIEW")
-        self.assertEqual(plan["transition"], "Under investigation")
-        self.assertEqual(plan["assignment"]["assignee_id"], ASSIGNEE_ID)
 
-    def test_reopen_persist_language_needs_review(self) -> None:
-        self.assertEqual(analyze_reopen_comment("It is still broken"), "NEEDS_REVIEW")
-        self.assertEqual(analyze_reopen_comment("This remains unconfirmed"), "NEEDS_REVIEW")
-        self.assertEqual(analyze_reopen_comment("OK"), "OK")
+class SafetyGateTest(unittest.TestCase):
+    def _run(self, issue, sportcast, now=BEFORE_KICKOFF):
+        return run(parse_issue(issue), sportcast, apply=True, now=now, verify=lambda *a: ["t"])
+
+    def test_tsd_389084_test_clone_is_read_only(self):
+        sportcast = _tsd_388989_sportcast()
+        result = self._run(_issue(summary="CLONE - Soccer SGM Request for test purposes please do not touch"),
+                           sportcast, now=AFTER_KICKOFF)
+        self.assertEqual({c[0] for c in sportcast.calls}, {"get"})
+        self.assertEqual([f.verdict for f in result.findings], [KICKED_OFF, KICKED_OFF])
+        self.assertIsNone(result.jira)
+        self.assertIn("test", " ".join(result.blockers))
+
+    def test_kicked_off_fixtures_are_not_republished(self):
+        sportcast = _tsd_388989_sportcast()
+        result = self._run(_issue(), sportcast, now=AFTER_KICKOFF)
+        self.assertEqual({c[0] for c in sportcast.calls}, {"get"})
+        self.assertFalse(result.applied)
+
+    def test_team_mismatch_stops(self):
+        sportcast = _tsd_388989_sportcast()
+        sportcast.definitions[551738] = _definition(551738, "Haiti", "Cuba", "2026-10-05T22:00:00Z")
+        result = self._run(_issue(), sportcast)
+        self.assertEqual(result.findings[0].verdict, TEAMS_MISMATCH)
+        self.assertFalse(result.applied)
+
+    def test_existing_different_betradar_id_is_not_overwritten(self):
+        sportcast = _tsd_388989_sportcast()
+        sportcast.betradar[551738] = "sr:match:1"
+        result = self._run(_issue(), sportcast)
+        self.assertEqual(result.findings[0].verdict, ID_MISMATCH)
+        self.assertNotIn("add", {c[0] for c in sportcast.calls})
+
+    def test_client_not_following_stops(self):
+        sportcast = _tsd_388989_sportcast()
+        sportcast.definitions[551736] = _definition(551736, "Guatemala", "Suriname", "2026-10-06T00:00:00Z",
+                                                    following=False)
+        result = self._run(_issue(), sportcast)
+        self.assertEqual(result.findings[1].verdict, CLIENT_NOT_FOLLOWING)
+        self.assertFalse(result.applied)
+
+    def test_non_betradar_client_id_stops(self):
+        issue = _issue(description="Sportcast Fixture ID: 551738\nClient Fixture ID: abc-xyz\n")
+        result = self._run(issue, _tsd_388989_sportcast())
+        self.assertEqual(result.findings[0].verdict, UNKNOWN_SOURCE)
+
+    def test_missing_fixture_ids_and_no_sportcast(self):
+        result = run(parse_issue(_issue(description="please add SGM")), None, apply=True)
+        self.assertIn("No 'Sportcast Fixture ID'", result.blockers[0])
+        result = run(parse_issue(_issue()), None, apply=True)
+        self.assertIn("Sportcast is not reachable", result.blockers[0])
+
+    def test_other_status_is_left_alone(self):
+        result = run(parse_issue(_issue(status="New")), None, apply=True)
+        self.assertEqual(result.branch, "fallback")
+        self.assertIsNone(result.jira)
+
+    def test_report_never_contains_client_api_keys(self):
+        result = self._run(_issue(), _tsd_388989_sportcast())
+        self.assertNotIn(SECRET_KEY, report(result))
+        self.assertNotIn(SECRET_KEY, json.dumps(result.jira))
+
+    def test_repeat_run_is_detected(self):
+        sportcast = _tsd_388989_sportcast()
+        first = run(parse_issue(_issue()), sportcast, now=AFTER_KICKOFF)
+        issue = _issue(comments=[{"author": {"displayName": "Cursor"}, "body": report(first)}])
+        second = run(parse_issue(issue), sportcast, now=AFTER_KICKOFF)
+        self.assertTrue(already_reported(second))
+
+
+class ReopenedTest(unittest.TestCase):
+    def _comment(self, body):
+        return [{"author": {"displayName": "Mendel", "emailAddress": "mendel@picklebet.com"}, "body": body},
+                {"author": {"displayName": "Support", "emailAddress": "a@openbet.com"}, "body": "Looking"}]
+
+    def test_customer_confirms(self):
+        result = run(parse_issue(_issue(status="Reopened", comments=self._comment("All good, thanks!"))), None)
+        self.assertEqual(result.jira["decision"], "OK")
+        self.assertEqual(result.jira["transition"], "Resolved")
+
+    def test_customer_says_still_missing(self):
+        result = run(parse_issue(_issue(status="Reopened", comments=self._comment("SGM still missing"))), None)
+        self.assertEqual(result.jira["decision"], "NEEDS_REVIEW")
+        self.assertEqual(result.jira["assignee_id"], ASSIGNEE_ID)
+
+    def test_analyze_reopen_comment(self):
         self.assertEqual(analyze_reopen_comment(""), "NEEDS_REVIEW")
-
-    def test_fallback_logs_todo(self) -> None:
-        result = run_issue(_issue(), status="Waiting for customer", confirm=True)
-        self.assertEqual(result, {"action": "todo", "issue_key": "PB-42", "message": "todo"})
-
-    def test_resolved_comment_template(self) -> None:
-        plan = transition_jira_resolved("PB-42")
-        self.assertEqual(
-            plan["comment"],
-            "Thanks for raising PB-42. Please check . If the issue persists please reopen the ticket.",
-        )
+        self.assertEqual(analyze_reopen_comment("OK"), "OK")
+        self.assertEqual(analyze_reopen_comment("It is still broken"), "NEEDS_REVIEW")
 
 
-class SourceSafetyTest(unittest.TestCase):
-    def test_skill_and_library_do_not_embed_url_hosts(self) -> None:
-        root = Path(__file__).resolve().parent
-        skill = root.parent / ".cursor" / "skills" / "picklebet-missing-ids" / "SKILL.md"
-        for path in (root / "workflow.py", root / "__init__.py", skill):
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if "https://" in line or "http://" in line:
-                    self.assertIn("startswith", line, path.name)
-
-
-class RedactTest(unittest.TestCase):
-    def test_redact_replaces_secret(self) -> None:
-        self.assertEqual(redact(f"key={API_KEY}", [API_KEY]), "key=[redacted]")
+class DatadogParsingTest(unittest.TestCase):
+    def test_only_production_deliveries_count(self):
+        message = ('Successfully sent and delivered a SinglesCreated message to Client: "Picklebet" (244). '
+                   'Details: Fixture: 551738,Url: "{url}",ClusterSource "Prematch", Response code: 200')
+        events = [
+            {"attributes": {"timestamp": "t1", "message": message.format(url="https://oddsfeeds.example.com/x")}},
+            {"attributes": {"timestamp": "t2", "message": message.format(url="https://oddsfeeds.staging.example.io/x")}},
+        ]
+        deliveries = parse_deliveries(events)
+        self.assertEqual([d.production for d in deliveries], [True, False])
+        self.assertEqual(deliveries[0].fixture_id, 551738)
 
 
 if __name__ == "__main__":

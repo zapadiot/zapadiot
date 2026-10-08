@@ -1,87 +1,98 @@
-"""Validated requests for the Picklebet missing consumer fixture workflow.
+"""Picklebet SGM repush / missing consumer fixture id workflow.
 
-Sportcast hosts and API keys are runtime inputs. This module does not embed
-them, and it refuses mutating calls unless the caller passes confirm=True.
+The successful path for these TSD tickets:
+  1. read the Sportcast fixture ids from the description,
+  2. check each fixture in Sportcast (teams, kickoff, Betradar consumer id,
+     whether the client follows Betbuilder),
+  3. add the Betradar consumer id when it is missing,
+  4. republish the fixture,
+  5. confirm SinglesCreated reached the client's production endpoint,
+  6. tell the customer and resolve the ticket.
+
+Sportcast writes and Jira transitions only happen with apply=True, never on
+test tickets, and never when a fixture needs a human decision.
 """
 
 from __future__ import annotations
 
-import json
-import os
+import hashlib
 import re
 import time
-import urllib.error
-import urllib.request
-from typing import Any, Callable, Mapping
-from urllib.parse import urlencode
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable, Protocol
+
+from picklebet_missing_ids.ticket import RequestedFixture, Ticket
 
 ASSIGNEE_ID = "712020:e626a9d2-bf67-4741-a80b-3a018547cce4"
 AUTOMATION_RULE_ID = "019f45bf-fbf0-7bbf-b180-ae122b0714ac"
 INCIDENT_RESOLUTION = "Workaround Applied"
-RESOLVING_TEAM = "Sportsbook Support"
-RESOLVED_COMMENT = (
-    "Thanks for raising {issue_key}. Please check . "
-    "If the issue persists please reopen the ticket."
-)
 REOPEN_OK_COMMENT = "Resolving"
+MARKER_PREFIX = "sgm-agent"
 
-AU_BASE_ENV = "SPORTCAST_AU_BASE"
-INTERNAL_BASE_ENV = "SPORTCAST_INTERNAL_BASE"
-ACCOUNT_KEY_ENV = "SPORTCAST_ACCOUNT_KEY"
-
-UPDATE_PATH = "/api/UpdateConsumerFixtureid"
-MATCH_STATE_PATH = "/api/AddOrUpdateFixtureMatchStateList"
+# Verdicts. The first two are the only ones the agent acts on by itself.
+ADD_ID_AND_REPUBLISH = "add_id_and_republish"
+REPUBLISH = "republish"
+KICKED_OFF = "kicked_off"
+IN_PLAY = "in_play"
+ID_MISMATCH = "id_mismatch"
+TEAMS_MISMATCH = "teams_mismatch"
+CLIENT_NOT_FOLLOWING = "client_not_following"
+NOT_FOUND = "not_found"
+UNKNOWN_SOURCE = "unknown_source"
+ACTIONABLE = {ADD_ID_AND_REPUBLISH, REPUBLISH}
 
 _PERSIST_MARKERS = (
-    "still",
-    "persist",
-    "persists",
-    "persistent",
-    "not fixed",
-    "isn't fixed",
-    "isnt fixed",
-    "not working",
-    "doesn't work",
-    "does not work",
-    "broken",
-    "same issue",
-    "reopen",
-    "unable",
-    "failed",
-    "wrong",
+    "still", "persist", "persists", "persistent", "not fixed", "isn't fixed", "isnt fixed",
+    "not working", "doesn't work", "does not work", "broken", "same issue", "reopen",
+    "unable", "failed", "wrong", "missing", "not available", "not showing",
 )
 _RESOLVED_MARKERS = (
-    "resolved",
-    "fixed",
-    "working now",
-    "works now",
-    "all good",
-    "sorted",
-    "no longer",
-    "confirmed",
+    "resolved", "fixed", "working now", "works now", "all good", "sorted", "no longer",
+    "confirmed", "available now", "showing now",
 )
-_BARE_OK = {"ok", "okay", "resolved", "fixed", "all good", "sorted"}
+_BARE_OK = {"ok", "okay", "resolved", "fixed", "all good", "sorted", "thanks", "thank you"}
 
 
-class ConfirmationRequired(RuntimeError):
-    """A mutating Sportcast or Jira action was requested without confirmation."""
+class Sportcast(Protocol):
+    def get_fixture(self, fixture_id: int) -> dict[str, Any]: ...
+    def consumer_id(self, fixture_id: int, source: str = "BetRadar") -> str: ...
+    def add_consumer_id(self, fixture_id: int, feed_id: str, source: str = "BetRadar") -> str: ...
+    def republish(self, definition: dict[str, Any]) -> None: ...
 
 
-class WorkflowError(RuntimeError):
-    """The workflow cannot continue with the data it was given."""
+@dataclass
+class Finding:
+    fixture_id: int
+    requested_id: str
+    info: str
+    verdict: str = NOT_FOUND
+    teams: str = ""
+    kickoff: datetime | None = None
+    betradar_id: str = ""
+    client_following: bool | None = None
+    client_last_published: str = ""
+    notes: list[str] = field(default_factory=list)
+    actions: list[str] = field(default_factory=list)
+    delivered: list[str] = field(default_factory=list)
 
 
-class SportcastError(WorkflowError):
-    """A Sportcast HTTP call failed."""
+@dataclass
+class Result:
+    ticket: Ticket
+    branch: str
+    findings: list[Finding] = field(default_factory=list)
+    applied: bool = False
+    blockers: list[str] = field(default_factory=list)
+    jira: dict[str, Any] | None = None
 
-
-def redact(text: str, secrets: list[str] | tuple[str, ...]) -> str:
-    """Remove secret values from text that might be logged or raised."""
-    cleaned = text
-    for secret in secrets:
-        if secret:
-            cleaned = cleaned.replace(secret, "[redacted]")
-    return cleaned
+    @property
+    def marker(self) -> str:
+        state = "|".join(
+            f"{f.fixture_id}:{f.verdict}:{f.betradar_id}:{len(f.delivered)}" for f in self.findings
+        )
+        digest = hashlib.sha1(f"{self.ticket.status}|{state}|{self.blockers}".encode()).hexdigest()[:10]
+        return f"{MARKER_PREFIX}:{self.branch}:{digest}"
 
 
 def branch_for_status(status: str) -> str:
@@ -93,452 +104,295 @@ def branch_for_status(status: str) -> str:
     return "fallback"
 
 
-def coerce_feed_providers(value: Any) -> bool:
-    if isinstance(value, bool):
+def betradar_feed_id(client_fixture_id: str) -> str:
+    """Return the Betradar consumer id for a client fixture id, or '' if it is not Betradar."""
+    value = (client_fixture_id or "").strip()
+    if value.startswith("sr:match:") and value[9:].isdigit():
         return value
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in {"true", "yes", "1"}:
-            return True
-        if text in {"false", "no", "0"}:
-            return False
-    raise WorkflowError("feedProviders must be a boolean")
+    if value.isdigit() and len(value) >= 7:
+        return f"sr:match:{value}"
+    return ""
 
 
-def _require_text(value: Any, name: str) -> str:
-    text = "" if value is None else str(value).strip()
-    if not text:
-        raise WorkflowError(f"{name} is required")
-    return text
-
-
-def _coerce_fixture_id(value: Any) -> int | str:
-    text = _require_text(value, "FixtureId")
-    if text.isdigit():
-        return int(text)
-    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:._-")
-    if any(character not in allowed for character in text):
-        raise WorkflowError("FixtureId has an unexpected shape")
-    return text
-
-
-def _coerce_consumer_id(value: Any) -> str:
-    text = _require_text(value, "consumer fixture id")
-    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:._-")
-    if any(character not in allowed for character in text):
-        raise WorkflowError("consumer fixture id has an unexpected shape")
-    return text
-
-
-def consumer_search_term(client_fixture_id: Any, feed_providers: Any) -> str:
-    """Return the Sportcast search value for a Picklebet fixture id."""
-    client_id = _require_text(client_fixture_id, "client_fixture_id")
-    if coerce_feed_providers(feed_providers):
-        return client_id
-    if client_id.startswith("sr:match:"):
-        return client_id
-    return f"sr:match:{client_id}"
-
-
-def _field_map(issue: Mapping[str, Any], names: Mapping[str, str] | None) -> dict[str, Any]:
-    if "fields" in issue and isinstance(issue["fields"], Mapping):
-        raw = dict(issue["fields"])
-    else:
-        raw = dict(issue)
-    if not names:
-        return raw
-    lifted = dict(raw)
-    for field_id, display_name in names.items():
-        if field_id in raw and display_name not in lifted:
-            lifted[display_name] = raw[field_id]
-    return lifted
-
-
-def _value_of(field_value: Any) -> Any:
-    if isinstance(field_value, Mapping):
-        for key in ("value", "name", "id"):
-            if key in field_value and field_value[key] not in (None, ""):
-                return field_value[key]
-    return field_value
-
-
-def extract_custom_fields(
-    issue: Mapping[str, Any],
-    names: Mapping[str, str] | None = None,
-) -> dict[str, Any]:
-    """Read the four workflow fields from a Jira issue payload.
-
-    `names` maps Jira custom field ids (customfield_12345) to display names.
-    """
-    fields = _field_map(issue, names)
-    client_fixture_id = _require_text(
-        _value_of(fields.get("client_fixture_id")),
-        "client_fixture_id",
-    )
-    fixture_id = _coerce_fixture_id(_value_of(fields.get("FixtureId")))
-    api_key = _require_text(_value_of(fields.get("apiKey")), "apiKey")
-    feed_providers = coerce_feed_providers(_value_of(fields.get("feedProviders")))
-    return {
-        "client_fixture_id": client_fixture_id,
-        "FixtureId": fixture_id,
-        "apiKey": api_key,
-        "feedProviders": feed_providers,
-    }
-
-
-def redacted_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
-    hidden = redact(
-        json.dumps({"apiKey": fields.get("apiKey", "")}),
-        [str(fields.get("apiKey", ""))],
-    )
-    visible = {key: value for key, value in fields.items() if key != "apiKey"}
-    visible["apiKey"] = json.loads(hidden)["apiKey"]
-    return visible
-
-
-def _base_url(env_name: str) -> str:
-    value = os.environ.get(env_name, "").strip().rstrip("/")
+def _parse_time(value: Any) -> datetime | None:
     if not value:
-        raise WorkflowError(f"{env_name} is not set")
-    if not value.startswith("https://"):
-        raise WorkflowError(f"{env_name} must be an https URL")
-    return value
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
-def update_consumer_fixture_url(fixture_id: Any, consumer_fixture_id: Any) -> str:
-    fixture = _coerce_fixture_id(fixture_id)
-    consumer = _coerce_consumer_id(consumer_fixture_id)
-    query = urlencode(
-        {
-            "fixtureId": fixture,
-            "consumerfixtureid": consumer,
-        }
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _teams_match(info: str, home: str, away: str) -> bool:
+    if not info:
+        return True
+    wanted = _norm(info)
+    return bool(home and away) and _norm(home) in wanted and _norm(away) in wanted
+
+
+def diagnose(
+    requested: RequestedFixture,
+    definition: dict[str, Any] | None,
+    betradar_id: str,
+    client_name: str,
+    now: datetime,
+) -> Finding:
+    finding = Finding(requested.fixture_id, requested.client_fixture_id, requested.info)
+    if not definition or not definition.get("fixtureId"):
+        finding.notes.append("Sportcast has no fixture with this id.")
+        return finding
+
+    home = (definition.get("homeTeam") or {}).get("team", {}).get("name", "")
+    away = (definition.get("awayTeam") or {}).get("team", {}).get("name", "")
+    details = definition.get("details") or {}
+    finding.teams = f"{home} v {away}"
+    finding.kickoff = _parse_time(details.get("startTimeUTC"))
+    finding.betradar_id = betradar_id
+
+    client = next(
+        (c for c in details.get("betBuilderClients") or []
+         if (c.get("clientName") or "").lower() == client_name.lower()),
+        None,
     )
-    return f"{_base_url(AU_BASE_ENV)}{UPDATE_PATH}?{query}"
+    if client is not None:
+        finding.client_following = bool(client.get("betBuilderFollowing"))
+        finding.client_last_published = str(client.get("lastPublished") or "")
 
-
-def match_state_payload(
-    fixture_id: Any,
-    api_key: str,
-    match_state: int,
-    account_key: str | None = None,
-) -> dict[str, Any]:
-    if match_state not in (1, 2):
-        raise WorkflowError("MatchState must be 1 (Live) or 2 (Settled)")
-    item_key = _require_text(api_key, "apiKey")
-    outer_key = _require_text(account_key or os.environ.get(ACCOUNT_KEY_ENV) or item_key, "apiKey")
-    return {
-        "Key": outer_key,
-        "Items": [
-            {
-                "Key": item_key,
-                "FixtureId": _coerce_fixture_id(fixture_id),
-                "MatchState": match_state,
-            }
-        ],
-    }
-
-
-def _require_confirm(confirm: bool, action: str) -> None:
-    if not confirm:
-        raise ConfirmationRequired(f"{action} needs explicit confirmation")
-
-
-class _Response:
-    def __init__(self, status: int, body: str = "") -> None:
-        self.status = status
-        self.body = body
-
-
-def _default_request(method: str, url: str, payload: dict[str, Any] | None, secrets: list[str]) -> _Response:
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            return _Response(response.status, raw)
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise SportcastError(
-            redact(f"Sportcast returned HTTP {exc.code}: {raw[:200]}", secrets)
-        ) from None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ConnectionError(redact(str(exc.reason if isinstance(exc, urllib.error.URLError) else exc), secrets)) from None
-
-
-def _with_network_retry(operation: Callable[[], _Response]) -> _Response:
-    try:
-        return operation()
-    except ConnectionError:
-        return operation()
-
-
-def _ensure_ok(response: _Response, secrets: list[str], action: str) -> _Response:
-    if response.status != 200:
-        detail = redact(response.body[:200], secrets)
-        raise SportcastError(f"{action} returned HTTP {response.status}: {detail}")
-    return response
-
-
-def update_consumer_fixture_id(
-    fixture_id: Any,
-    consumer_fixture_id: Any,
-    *,
-    confirm: bool = False,
-    http_get: Callable[[str], Any] | None = None,
-) -> _Response:
-    """GET the consumer-fixture update endpoint. Requires confirm=True."""
-    _require_confirm(confirm, "UpdateConsumerFixtureid")
-    fixture = _coerce_fixture_id(fixture_id)
-    consumer = _coerce_consumer_id(consumer_fixture_id)
-    url = update_consumer_fixture_url(fixture, consumer)
-
-    def once() -> _Response:
-        if http_get is None:
-            return _default_request("GET", url, None, [])
-        result = http_get(url)
-        if isinstance(result, _Response):
-            return result
-        if isinstance(result, int):
-            return _Response(result, "")
-        status = int(getattr(result, "status", result))
-        body = str(getattr(result, "body", ""))
-        return _Response(status, body)
-
-    return _ensure_ok(_with_network_retry(once), [], "UpdateConsumerFixtureid")
-
-
-def set_match_state(
-    fixture_id: Any,
-    api_key: str,
-    match_state: int,
-    *,
-    confirm: bool = False,
-    account_key: str | None = None,
-    http_post: Callable[[str, dict[str, Any]], Any] | None = None,
-) -> _Response:
-    """POST a Live (1) or Settled (2) match state. Requires confirm=True."""
-    _require_confirm(confirm, "AddOrUpdateFixtureMatchStateList")
-    payload = match_state_payload(fixture_id, api_key, match_state, account_key)
-    secrets = [payload["Key"], payload["Items"][0]["Key"]]
-    url = f"{_base_url(INTERNAL_BASE_ENV)}{MATCH_STATE_PATH}"
-
-    def once() -> _Response:
-        if http_post is None:
-            return _default_request("POST", url, payload, secrets)
-        result = http_post(url, payload)
-        if isinstance(result, _Response):
-            return result
-        if isinstance(result, int):
-            return _Response(result, "")
-        status = int(getattr(result, "status", result))
-        body = str(getattr(result, "body", ""))
-        return _Response(status, body)
-
-    try:
-        response = _ensure_ok(_with_network_retry(once), secrets, "AddOrUpdateFixtureMatchStateList")
-    except SportcastError:
-        raise
-    except ConnectionError as exc:
-        raise SportcastError(redact(str(exc), secrets)) from None
-    return response
-
-
-def wait_seconds(seconds: float, sleep: Callable[[float], None] | None = None) -> None:
-    if seconds < 0:
-        raise WorkflowError("wait seconds must be zero or greater")
-    (sleep or time.sleep)(seconds)
-
-
-def transition_jira_resolved(issue_key: str, comment: str | None = None) -> dict[str, Any]:
-    """Plan a Resolved transition. Applying it is an MCP call, not this function."""
-    key = _require_text(issue_key, "issue_key")
-    return {
-        "issue_key": key,
-        "transition": "Resolved",
-        "comment": comment if comment is not None else RESOLVED_COMMENT.format(issue_key=key),
-        "fields": {
-            "Incident Resolution": INCIDENT_RESOLUTION,
-            "Resolving Team": RESOLVING_TEAM,
-        },
-    }
-
-
-def transition_jira_under_investigation(issue_key: str) -> dict[str, Any]:
-    key = _require_text(issue_key, "issue_key")
-    return {
-        "issue_key": key,
-        "transition": "Under investigation",
-    }
-
-
-def assign_jira_issue(issue_key: str, assignee_id: str = ASSIGNEE_ID) -> dict[str, Any]:
-    key = _require_text(issue_key, "issue_key")
-    assignee = _require_text(assignee_id, "assignee_id")
-    return {
-        "issue_key": key,
-        "assignee_id": assignee,
-    }
-
-
-def _has_marker(text: str, marker: str) -> bool:
-    pattern = r"\b" + re.escape(marker).replace(r"\ ", r"\s+") + r"\b"
-    return re.search(pattern, text) is not None
+    wanted = betradar_feed_id(requested.client_fixture_id)
+    if requested.client_fixture_id and not wanted:
+        finding.verdict = UNKNOWN_SOURCE
+        finding.notes.append(f"Client fixture id {requested.client_fixture_id} is not a Betradar id.")
+    elif not _teams_match(requested.info, home, away):
+        finding.verdict = TEAMS_MISMATCH
+        finding.notes.append(f"Ticket says '{requested.info}', Sportcast has '{finding.teams}'.")
+    elif definition.get("isFixtureInplay"):
+        finding.verdict = IN_PLAY
+        finding.notes.append("The fixture is in play.")
+    elif finding.kickoff is not None and finding.kickoff <= now:
+        finding.verdict = KICKED_OFF
+        finding.notes.append(f"Kickoff was {finding.kickoff:%Y-%m-%d %H:%M} UTC; there is nothing to repush.")
+    elif client is None or not finding.client_following:
+        finding.verdict = CLIENT_NOT_FOLLOWING
+        finding.notes.append(f"{client_name or 'The client'} is not following Betbuilder on this fixture.")
+    elif wanted and betradar_id and betradar_id != wanted:
+        finding.verdict = ID_MISMATCH
+        finding.notes.append(f"Sportcast already has Betradar id {betradar_id}; the ticket has {wanted}.")
+    elif wanted and not betradar_id:
+        finding.verdict = ADD_ID_AND_REPUBLISH
+        finding.notes.append(f"Betradar consumer id is missing; {wanted} will be added.")
+    else:
+        finding.verdict = REPUBLISH
+        finding.notes.append("Mapping is present; the fixture will be republished.")
+    return finding
 
 
 def analyze_reopen_comment(comment: str) -> str:
     """Return OK when the customer confirms the fix, otherwise NEEDS_REVIEW."""
-    text = (comment or "").strip()
-    if not text:
+    lowered = (comment or "").strip().lower().rstrip(".!")
+    if not lowered:
         return "NEEDS_REVIEW"
-    lowered = text.lower().rstrip(".!")
     if lowered in _BARE_OK:
         return "OK"
-    persist = any(_has_marker(lowered, marker) for marker in _PERSIST_MARKERS)
-    resolved = any(_has_marker(lowered, marker) for marker in _RESOLVED_MARKERS)
-    if resolved and not persist:
+
+    def has(marker: str) -> bool:
+        return re.search(r"\b" + re.escape(marker).replace(r"\ ", r"\s+") + r"\b", lowered) is not None
+
+    if any(has(m) for m in _RESOLVED_MARKERS) and not any(has(m) for m in _PERSIST_MARKERS):
         return "OK"
     return "NEEDS_REVIEW"
 
 
-def reopen_plan(issue_key: str, decision: str) -> dict[str, Any]:
-    key = _require_text(issue_key, "issue_key")
-    if decision == "OK":
-        return {
-            "action": "resolve",
-            "issue_key": key,
-            "comment": REOPEN_OK_COMMENT,
-            "transition": "Resolved",
-            "resolution": "Fixed",
-            "fields": {
-                "Incident Resolution": INCIDENT_RESOLUTION,
-            },
-        }
-    if decision == "NEEDS_REVIEW":
-        plan = transition_jira_under_investigation(key)
-        plan["action"] = "investigate"
-        plan["assignment"] = assign_jira_issue(key)
-        return plan
-    raise WorkflowError("reopen decision must be OK or NEEDS_REVIEW")
+def latest_customer_comment(ticket: Ticket) -> str:
+    for comment in reversed(ticket.comments):
+        email = comment.get("email", "").lower()
+        if email and not email.endswith("@openbet.com"):
+            return comment.get("body", "")
+    return ""
 
 
-def _issue_key(issue: Mapping[str, Any]) -> str:
-    key = issue.get("key") or issue.get("issue_key")
-    return _require_text(key, "issue_key")
+def customer_comment(findings: list[Finding]) -> str:
+    lines = ["Hello,", "", "SGM for the requested fixtures is now available:", ""]
+    for f in findings:
+        requested = f" / {f.requested_id}" if f.requested_id else ""
+        lines.append(f"- {f.teams} (Sportcast {f.fixture_id}{requested})")
+    lines += ["", "Please reopen this ticket if any fixture is still missing.", "", "Regards"]
+    return "\n".join(lines)
 
 
-def _search_resolved_id(search_term: str, search_fn: Callable[[str], Any]) -> str:
-    found = search_fn(search_term)
-    if isinstance(found, Mapping):
-        found = found.get("resolvedFixtureId") or found.get("id")
-    return _coerce_consumer_id(found)
+def resolution_notes(findings: list[Finding]) -> str:
+    added = [f for f in findings if f.verdict == ADD_ID_AND_REPUBLISH]
+    parts = []
+    if added:
+        parts.append(
+            "Mapped the missing Betradar consumer id for "
+            + ", ".join(f"{f.teams} ({f.fixture_id} / {betradar_feed_id(f.requested_id)})" for f in added)
+        )
+    parts.append(f"republished {len(findings)} requested fixture(s); SinglesCreated delivered to production.")
+    text = " and ".join(parts)
+    return text[0].upper() + text[1:]
 
 
-def run_under_investigation(
-    issue: Mapping[str, Any],
-    *,
-    confirm: bool,
-    search_fn: Callable[[str], Any],
-    names: Mapping[str, str] | None = None,
-    http_get: Callable[[str], Any] | None = None,
-    http_post: Callable[[str, dict[str, Any]], Any] | None = None,
-    sleep: Callable[[float], None] | None = None,
-    account_key: str | None = None,
-) -> dict[str, Any]:
-    """Search, update the consumer fixture, set Live then Settled, and plan Jira."""
-    _require_confirm(confirm, "Under investigation workflow")
-    fields = extract_custom_fields(issue, names)
-    search_term = consumer_search_term(fields["client_fixture_id"], fields["feedProviders"])
-    resolved = _search_resolved_id(search_term, search_fn)
-    update = update_consumer_fixture_id(
-        fields["FixtureId"],
-        resolved,
-        confirm=True,
-        http_get=http_get,
-    )
-    set_match_state(
-        fields["FixtureId"],
-        fields["apiKey"],
-        1,
-        confirm=True,
-        account_key=account_key,
-        http_post=http_post,
-    )
-    wait_seconds(3, sleep=sleep)
-    set_match_state(
-        fields["FixtureId"],
-        fields["apiKey"],
-        2,
-        confirm=True,
-        account_key=account_key,
-        http_post=http_post,
-    )
-    issue_key = _issue_key(issue)
+def jira_resolve_plan(ticket: Ticket, findings: list[Finding]) -> dict[str, Any]:
     return {
-        "action": "resolved",
-        "issue_key": issue_key,
-        "searchTerm": search_term,
-        "resolvedFixtureId": resolved,
-        "updateStatus": update.status,
-        "matchStates": [1, 2],
-        "jira": transition_jira_resolved(issue_key),
-        "fields": redacted_fields(fields),
+        "issue_key": ticket.key,
+        "transition": "Resolved",
+        "comment": customer_comment(findings),
+        "incident_resolution": INCIDENT_RESOLUTION,
+        "resolution_notes": resolution_notes(findings),
     }
 
 
-def run_reopened(
-    issue: Mapping[str, Any],
-    comment: str,
-    *,
-    confirm: bool,
-    analyze_fn: Callable[[str], str] | None = None,
-) -> dict[str, Any]:
-    _require_confirm(confirm, "Reopened workflow")
-    decision = (analyze_fn or analyze_reopen_comment)(comment)
-    if decision not in {"OK", "NEEDS_REVIEW"}:
-        decision = "NEEDS_REVIEW"
-    plan = reopen_plan(_issue_key(issue), decision)
-    plan["decision"] = decision
-    return plan
-
-
-def run_issue(
-    issue: Mapping[str, Any],
-    *,
-    status: str,
-    confirm: bool = False,
-    comment: str = "",
-    search_fn: Callable[[str], Any] | None = None,
-    names: Mapping[str, str] | None = None,
-    http_get: Callable[[str], Any] | None = None,
-    http_post: Callable[[str, dict[str, Any]], Any] | None = None,
-    sleep: Callable[[float], None] | None = None,
-    analyze_fn: Callable[[str], str] | None = None,
-    account_key: str | None = None,
-) -> dict[str, Any]:
-    """Dispatch on Jira status. Unknown statuses return the manual fallback."""
-    branch = branch_for_status(status)
-    if branch == "fallback":
+def jira_reopen_plan(ticket: Ticket, decision: str) -> dict[str, Any]:
+    if decision == "OK":
         return {
-            "action": "todo",
-            "issue_key": issue.get("key") or issue.get("issue_key"),
-            "message": "todo",
+            "issue_key": ticket.key,
+            "transition": "Resolved",
+            "comment": REOPEN_OK_COMMENT,
+            "resolution": "Fixed",
+            "incident_resolution": INCIDENT_RESOLUTION,
         }
-    if branch == "reopened":
-        return run_reopened(issue, comment, confirm=confirm, analyze_fn=analyze_fn)
-    if search_fn is None:
-        raise WorkflowError("search_fn is required for Under investigation")
-    return run_under_investigation(
-        issue,
-        confirm=confirm,
-        search_fn=search_fn,
-        names=names,
-        http_get=http_get,
-        http_post=http_post,
-        sleep=sleep,
-        account_key=account_key,
-    )
+    return {"issue_key": ticket.key, "transition": "Under investigation", "assignee_id": ASSIGNEE_ID}
+
+
+def _betradar_from_definition(definition: dict[str, Any]) -> str:
+    for item in (definition.get("details") or {}).get("consumerfixtureIdList") or []:
+        if item.get("sourceName") == "BetRadar" and item.get("consumerFixtureId"):
+            return str(item["consumerFixtureId"])
+    return ""
+
+
+def run(
+    ticket: Ticket,
+    sportcast: Sportcast | None,
+    *,
+    apply: bool = False,
+    now: datetime | None = None,
+    verify: Callable[[int, str, str], list[str]] | None = None,
+    verify_timeout: float = 180,
+    poll_every: float = 15,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Result:
+    """Diagnose the ticket and, when allowed, fix and verify it.
+
+    verify(fixture_id, client_name, since_iso) returns production delivery
+    timestamps, or raises when delivery cannot be checked.
+    """
+    now = now or datetime.now(timezone.utc)
+    result = Result(ticket=ticket, branch=branch_for_status(ticket.status))
+
+    if result.branch == "fallback":
+        result.blockers.append(f"Status is '{ticket.status}'; only Under investigation and Reopened are handled.")
+        return result
+
+    if result.branch == "reopened":
+        decision = analyze_reopen_comment(latest_customer_comment(ticket))
+        result.jira = jira_reopen_plan(ticket, decision)
+        result.jira["decision"] = decision
+        return result
+
+    if not ticket.fixtures:
+        result.blockers.append("No 'Sportcast Fixture ID' found in the description.")
+        return result
+    if not ticket.client_name:
+        result.blockers.append("Operator/s (TSD) and Organizations do not name a Sportcast client.")
+        return result
+    if sportcast is None:
+        result.blockers.append("Sportcast is not reachable from this run (see missing settings).")
+        return result
+
+    definitions: dict[int, dict[str, Any]] = {}
+    for requested in ticket.fixtures:
+        definition = sportcast.get_fixture(requested.fixture_id)
+        definitions[requested.fixture_id] = definition
+        betradar = sportcast.consumer_id(requested.fixture_id) if definition.get("fixtureId") else ""
+        betradar = betradar or _betradar_from_definition(definition)
+        result.findings.append(diagnose(requested, definition, betradar, ticket.client_name, now))
+
+    manual = [f for f in result.findings if f.verdict not in ACTIONABLE]
+    if manual and all(f.verdict == KICKED_OFF for f in result.findings):
+        result.blockers.append("All requested fixtures have kicked off; nothing to repush.")
+    elif manual:
+        result.blockers.append("Some fixtures need a human decision; nothing was changed.")
+    if ticket.is_test:
+        result.blockers.append("Ticket is marked as a test ('do not touch'); read-only run.")
+    if not ticket.is_repush:
+        result.blockers.append(f"Category is '{ticket.category}', not Sportcast > Repush SGM.")
+    if result.blockers or not apply:
+        return result
+
+    started = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for finding in result.findings:
+        if finding.verdict == ADD_ID_AND_REPUBLISH:
+            feed_id = betradar_feed_id(finding.requested_id)
+            message = sportcast.add_consumer_id(finding.fixture_id, feed_id)
+            finding.actions.append(f"Added Betradar consumer id {feed_id}: {message}")
+            if sportcast.consumer_id(finding.fixture_id) != feed_id:
+                result.blockers.append(f"{finding.fixture_id}: consumer id did not stick ({message}).")
+                return result
+        sportcast.republish(sportcast.get_fixture(finding.fixture_id))
+        finding.actions.append("Republished.")
+    result.applied = True
+
+    if verify is None:
+        result.blockers.append("Datadog is not configured; delivery to production was not verified.")
+        return result
+    waited = 0.0
+    while True:
+        for finding in result.findings:
+            if not finding.delivered:
+                finding.delivered = verify(finding.fixture_id, ticket.client_name, started)
+        if all(f.delivered for f in result.findings) or waited >= verify_timeout:
+            break
+        sleep(poll_every)
+        waited += poll_every
+    missing = [str(f.fixture_id) for f in result.findings if not f.delivered]
+    if missing:
+        result.blockers.append(f"No production SinglesCreated delivery seen yet for {', '.join(missing)}.")
+        return result
+
+    result.jira = jira_resolve_plan(ticket, result.findings)
+    return result
+
+
+def report(result: Result, *, missing_settings: list[str] | None = None,
+           jira_outcome: str = "") -> str:
+    """Plain-text summary for the Jira comment the cloud agent posts."""
+    t = result.ticket
+    lines = [f"{t.key} ({t.status}) — {t.client_name or 'unknown client'}, {t.category or 'no category'}"]
+    if result.branch == "fallback":
+        lines.append("No action: " + "; ".join(result.blockers))
+    for f in result.findings:
+        kickoff = f"{f.kickoff:%Y-%m-%d %H:%M} UTC" if f.kickoff else "unknown kickoff"
+        following = {True: "following", False: "not following", None: "not listed"}[f.client_following]
+        lines.append("")
+        lines.append(f"Fixture {f.fixture_id} — {f.teams or f.info or 'not found'} — {kickoff}")
+        lines.append(f"  Betradar id: {f.betradar_id or 'missing'} (ticket: {f.requested_id or 'none'})")
+        lines.append(f"  {t.client_name} Betbuilder: {following}, last published {f.client_last_published or 'never'}")
+        lines.append(f"  Verdict: {f.verdict.replace('_', ' ')}")
+        for note in f.notes + f.actions:
+            lines.append(f"  - {note}")
+        if f.delivered:
+            lines.append(f"  - SinglesCreated delivered to production at {f.delivered[0]}")
+    if result.jira:
+        lines.append("")
+        lines.append(f"Jira: {jira_outcome or 'planned'} -> {result.jira['transition']}")
+    if missing_settings:
+        lines.append("")
+        lines.append("Missing settings for this run: " + ", ".join(missing_settings))
+    if result.blockers and result.branch != "fallback":
+        lines.append("")
+        lines.append("Not done: " + " ".join(result.blockers))
+    lines.append("")
+    lines.append(f"[{result.marker}]")
+    return "\n".join(lines)
+
+
+def already_reported(result: Result) -> bool:
+    """True when the last comment already carries this exact run marker."""
+    if not result.ticket.comments:
+        return False
+    return f"[{result.marker}]" in result.ticket.comments[-1].get("body", "")
