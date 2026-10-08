@@ -31,6 +31,7 @@ Read these from the environment or the Jira issue at runtime. Do not write them 
 | `SPORTCAST_INTERNAL_BASE` | HTTPS base for `getclient` and match state |
 | `SPORTCAST_ACCOUNT_KEY` | Outer match-state `Key`, when it differs from the issue |
 | Issue field `apiKey` | Item `Key`, and the outer `Key` when the account env var is unset |
+| `SPORTCAST_OPERATOR_KEYS` | JSON operator-to-API-key table, used when the issue has no `apiKey` |
 
 If a base URL is unset, stop and say which variable is missing. Do not guess a host.
 
@@ -53,9 +54,19 @@ From the Jira issue, via Atlassian `jira_get_issue` (authenticate the Atlassian 
 
 Pass the issue payload and, when the values sit on `customfield_*` ids, the id-to-name map into `extract_custom_fields`. Log `redacted_fields` only.
 
+## Operator API key
+
+When the issue has no `apiKey`, take the key from the operator instead, as the automation rule's custom field extractor agent does:
+
+1. Read `Operator/s (TSD)` (`customfield_11360`). It holds an Assets object reference such as `{"objectId": "46193"}`.
+2. Resolve the label with Atlassian `getAssetsObject` (numeric `objectId`). For example, `46193` is `Picklebet`.
+3. Pass that label as `operator=` to `extract_custom_fields` or `run_issue`. `operator_api_key` matches it case-insensitively against `SPORTCAST_OPERATOR_KEYS`.
+
+`SPORTCAST_OPERATOR_KEYS` accepts `{"Picklebet": "<key>"}`, `{"Picklebet": {"apikey": "<key>"}}`, or `[{"operator": "Picklebet", "apikey": "<key>"}]`. If it is unset or has no entry for the operator, stop and name the gap. Do not ask an AI step to recall a key.
+
 ## Branch: Under investigation
 
-1. `extract_custom_fields`.
+1. `extract_custom_fields`, with `operator=` when the issue has no `apiKey`.
 2. `client_region(apiKey)`, then `region_base_url(region)`. Stop here on an unsupported region or a missing base URL.
 3. `consumer_search_term(client_fixture_id, feedProviders)`.
    - `feedProviders` true: the client fixture id itself.

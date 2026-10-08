@@ -29,6 +29,10 @@ AU_BASE_ENV = "SPORTCAST_AU_BASE"
 EU_BASE_ENV = "SPORTCAST_EU_BASE"
 INTERNAL_BASE_ENV = "SPORTCAST_INTERNAL_BASE"
 ACCOUNT_KEY_ENV = "SPORTCAST_ACCOUNT_KEY"
+OPERATOR_KEYS_ENV = "SPORTCAST_OPERATOR_KEYS"
+
+_OPERATOR_NAME_KEYS = ("operator", "Operator", "name", "Name")
+_OPERATOR_KEY_KEYS = ("apikey", "apiKey", "ApiKey", "key", "Key")
 
 REGION_BASE_ENVS = {
     "PROD_AU": AU_BASE_ENV,
@@ -169,13 +173,70 @@ def _value_of(field_value: Any) -> Any:
     return field_value
 
 
+def _first_text(entry: Mapping[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = entry.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def parse_operator_keys(raw: str) -> dict[str, str]:
+    """Parse the operator-to-API-key table without echoing its contents.
+
+    Accepts {"Picklebet": "<key>"}, {"Picklebet": {"apikey": "<key>"}}, or
+    [{"operator": "Picklebet", "apikey": "<key>"}].
+    """
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise WorkflowError(f"{OPERATOR_KEYS_ENV} is not valid JSON") from None
+    if isinstance(data, Mapping):
+        entries = []
+        for name, value in data.items():
+            if isinstance(value, Mapping):
+                entries.append({**value, "operator": name})
+            else:
+                entries.append({"operator": name, "apikey": value})
+    elif isinstance(data, list):
+        entries = data
+    else:
+        raise WorkflowError(f"{OPERATOR_KEYS_ENV} must be a JSON object or array")
+    table: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise WorkflowError(f"{OPERATOR_KEYS_ENV} entries must be objects")
+        name = _first_text(entry, _OPERATOR_NAME_KEYS)
+        key = _first_text(entry, _OPERATOR_KEY_KEYS)
+        if name and key:
+            table[name.casefold()] = key
+    return table
+
+
+def operator_api_key(operator: Any, table: Mapping[str, str] | None = None) -> str:
+    """Return the Sportcast API key for an operator name, e.g. the Operator/s (TSD) label."""
+    name = _require_text(operator, "operator")
+    if table is None:
+        raw = os.environ.get(OPERATOR_KEYS_ENV, "").strip()
+        if not raw:
+            raise WorkflowError(f"{OPERATOR_KEYS_ENV} is not set")
+        table = parse_operator_keys(raw)
+    key = table.get(name.casefold(), "")
+    if not key:
+        raise WorkflowError(f"no Sportcast API key configured for operator {name}")
+    return key
+
+
 def extract_custom_fields(
     issue: Mapping[str, Any],
     names: Mapping[str, str] | None = None,
+    operator: Any = None,
 ) -> dict[str, Any]:
     """Read the four workflow fields from a Jira issue payload.
 
     `names` maps Jira custom field ids (customfield_12345) to display names.
+    When the issue has no `apiKey`, `operator` is looked up in the
+    operator key table instead.
     """
     fields = _field_map(issue, names)
     client_fixture_id = _require_text(
@@ -183,7 +244,11 @@ def extract_custom_fields(
         "client_fixture_id",
     )
     fixture_id = _coerce_fixture_id(_value_of(fields.get("FixtureId")))
-    api_key = _require_text(_value_of(fields.get("apiKey")), "apiKey")
+    issue_key_value = _value_of(fields.get("apiKey"))
+    if (issue_key_value is None or not str(issue_key_value).strip()) and operator is not None:
+        api_key = operator_api_key(operator)
+    else:
+        api_key = _require_text(issue_key_value, "apiKey")
     feed_providers = coerce_feed_providers(_value_of(fields.get("feedProviders")))
     return {
         "client_fixture_id": client_fixture_id,
@@ -514,10 +579,11 @@ def run_under_investigation(
     http_post: Callable[[str, dict[str, Any]], Any] | None = None,
     sleep: Callable[[float], None] | None = None,
     account_key: str | None = None,
+    operator: Any = None,
 ) -> dict[str, Any]:
     """Resolve the region, search, update, set Live then Settled, and plan Jira."""
     _require_confirm(confirm, "Under investigation workflow")
-    fields = extract_custom_fields(issue, names)
+    fields = extract_custom_fields(issue, names, operator=operator)
     region = client_region(fields["apiKey"], http_get=http_get)
     # Stop on an unsupported region or a missing base URL before searching.
     region_base_url(region)
@@ -590,6 +656,7 @@ def run_issue(
     sleep: Callable[[float], None] | None = None,
     analyze_fn: Callable[[str], str] | None = None,
     account_key: str | None = None,
+    operator: Any = None,
 ) -> dict[str, Any]:
     """Dispatch on Jira status. Unknown statuses return the manual fallback."""
     branch = branch_for_status(status)
@@ -612,4 +679,5 @@ def run_issue(
         http_post=http_post,
         sleep=sleep,
         account_key=account_key,
+        operator=operator,
     )

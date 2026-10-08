@@ -6,6 +6,7 @@ import json
 import os
 import unittest
 from pathlib import Path
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from picklebet_missing_ids.workflow import (
@@ -22,7 +23,10 @@ from picklebet_missing_ids.workflow import (
     consumer_search_term,
     extract_custom_fields,
     get_client_url,
+    OPERATOR_KEYS_ENV,
     match_state_payload,
+    operator_api_key,
+    parse_operator_keys,
     redact,
     region_base_url,
     run_issue,
@@ -117,6 +121,61 @@ class SearchAndFieldsTest(unittest.TestCase):
         self.assertEqual(branch_for_status("Under investigation"), "under_investigation")
         self.assertEqual(branch_for_status("Reopened"), "reopened")
         self.assertEqual(branch_for_status("In Progress"), "fallback")
+
+
+class OperatorKeyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._previous = os.environ.get(OPERATOR_KEYS_ENV)
+
+    def tearDown(self) -> None:
+        if self._previous is None:
+            os.environ.pop(OPERATOR_KEYS_ENV, None)
+        else:
+            os.environ[OPERATOR_KEYS_ENV] = self._previous
+
+    def test_parses_object_nested_and_array_shapes(self) -> None:
+        shapes = (
+            {"Picklebet": API_KEY},
+            {"Picklebet": {"apikey": API_KEY, "clientid": "7"}},
+            [{"operator": "Picklebet", "apikey": API_KEY}],
+            [{"Name": "Picklebet", "Key": API_KEY}],
+        )
+        for shape in shapes:
+            self.assertEqual(parse_operator_keys(json.dumps(shape)), {"picklebet": API_KEY})
+
+    def test_lookup_is_case_insensitive_and_reads_env(self) -> None:
+        os.environ[OPERATOR_KEYS_ENV] = json.dumps([{"operator": "Picklebet", "apikey": API_KEY}])
+        self.assertEqual(operator_api_key("  PICKLEBET "), API_KEY)
+
+    def test_missing_env_or_operator_names_only_the_gap(self) -> None:
+        os.environ.pop(OPERATOR_KEYS_ENV, None)
+        with self.assertRaises(WorkflowError) as caught:
+            operator_api_key("Picklebet")
+        self.assertIn(OPERATOR_KEYS_ENV, str(caught.exception))
+
+        with self.assertRaises(WorkflowError) as caught:
+            operator_api_key("Other", {"picklebet": API_KEY})
+        self.assertIn("operator Other", str(caught.exception))
+        self.assertNotIn(API_KEY, str(caught.exception))
+
+    def test_bad_table_does_not_echo_contents(self) -> None:
+        for raw in (f"not json {API_KEY}", json.dumps(API_KEY), json.dumps([API_KEY])):
+            with self.assertRaises(WorkflowError) as caught:
+                parse_operator_keys(raw)
+            self.assertNotIn(API_KEY, str(caught.exception))
+
+    def test_extract_falls_back_to_operator_key(self) -> None:
+        issue = _issue()
+        del issue["fields"]["apiKey"]
+        with self.assertRaises(WorkflowError):
+            extract_custom_fields(issue)
+        os.environ[OPERATOR_KEYS_ENV] = json.dumps({"Picklebet": API_KEY})
+        self.assertEqual(extract_custom_fields(issue, operator="Picklebet")["apiKey"], API_KEY)
+
+    def test_issue_api_key_wins_over_operator(self) -> None:
+        os.environ[OPERATOR_KEYS_ENV] = json.dumps({"Picklebet": "operator-key"})
+        fields = extract_custom_fields(_issue(), operator="Picklebet")
+        self.assertEqual(fields["apiKey"], API_KEY)
 
 
 class RegionTest(_SportcastEnv):
@@ -318,6 +377,30 @@ class EndToEndTest(_SportcastEnv):
         self.assertEqual(events[3][1], 1)
         self.assertEqual(events[5][1], 2)
         self.assertEqual(events[3][2]["Key"], ACCOUNT_KEY)
+        self.assertNotIn(API_KEY, json.dumps(result))
+
+    def test_operator_key_is_used_for_getclient_and_match_state(self) -> None:
+        patcher = mock.patch.dict(os.environ, {OPERATOR_KEYS_ENV: json.dumps({"Picklebet": API_KEY})})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        issue = _issue()
+        del issue["fields"]["apiKey"]
+        events: list[tuple] = []
+        posts: list[dict] = []
+
+        result = run_issue(
+            issue,
+            status="Under investigation",
+            confirm=True,
+            operator="Picklebet",
+            search_fn=lambda term: "sr:match:998877",
+            http_get=_routing_get("PROD_AU", events),
+            http_post=lambda url, body: posts.append(body) or 200,
+            sleep=lambda seconds: None,
+        )
+        self.assertEqual(parse_qs(urlsplit(events[0][1]).query)["key"], [API_KEY])
+        self.assertEqual(posts[0]["Items"][0]["Key"], API_KEY)
+        self.assertEqual(result["fields"]["apiKey"], "[redacted]")
         self.assertNotIn(API_KEY, json.dumps(result))
 
     def test_eu_client_updates_on_eu_base(self) -> None:
