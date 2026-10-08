@@ -28,6 +28,17 @@ REOPEN_OK_COMMENT = "Resolving"
 AU_BASE_ENV = "SPORTCAST_AU_BASE"
 INTERNAL_BASE_ENV = "SPORTCAST_INTERNAL_BASE"
 ACCOUNT_KEY_ENV = "SPORTCAST_ACCOUNT_KEY"
+DEFAULT_AU_BASE = "https://clusterau.sportcastlive.com"
+DEFAULT_INTERNAL_BASE = "https://clusterinternal.sportcastlive.com"
+_DEFAULT_BASES = {
+    AU_BASE_ENV: DEFAULT_AU_BASE,
+    INTERNAL_BASE_ENV: DEFAULT_INTERNAL_BASE,
+}
+
+_FIXTURE_PAIR = re.compile(
+    r"Sportcast\s+Fixture\s+ID:\s*([0-9]+)\s*Client\s+Fixture\s+ID:\s*([A-Za-z0-9:._-]+)",
+    re.IGNORECASE,
+)
 
 UPDATE_PATH = "/api/UpdateConsumerFixtureid"
 MATCH_STATE_PATH = "/api/AddOrUpdateFixtureMatchStateList"
@@ -186,6 +197,84 @@ def extract_custom_fields(
     }
 
 
+def _plain_text(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", value or ""))
+
+
+def description_fixture_pairs(description: str) -> list[dict[str, Any]]:
+    """Read Sportcast and client fixture ids from an issue description.
+
+    Real Picklebet SGM tickets put one or more pairs in the description.
+    Custom fields win when both ids are present.
+    """
+    pairs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for fixture_id, client_id in _FIXTURE_PAIR.findall(_plain_text(description)):
+        key = (fixture_id, client_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append({"FixtureId": int(fixture_id), "client_fixture_id": client_id})
+    return pairs
+
+
+def _description_text(issue: Mapping[str, Any], fields: Mapping[str, Any]) -> str:
+    for candidate in (fields.get("description"), issue.get("description")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return ""
+
+
+def _optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def issue_targets(
+    issue: Mapping[str, Any],
+    names: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return one target per fixture.
+
+    Named custom fields are used when both ids are set. Otherwise each
+    description pair is a target. feedProviders defaults to false, which
+    keeps an existing sr:match prefix and adds one when it is missing.
+    The item apiKey is the issue field, then SPORTCAST_ACCOUNT_KEY.
+    """
+    fields = _field_map(issue, names)
+    if _optional_text(_value_of(fields.get("client_fixture_id"))) and _optional_text(
+        _value_of(fields.get("FixtureId"))
+    ):
+        return [extract_custom_fields(issue, names)]
+
+    pairs = description_fixture_pairs(_description_text(issue, fields))
+    if not pairs:
+        return [extract_custom_fields(issue, names)]
+
+    feed_raw = fields.get("feedProviders")
+    if feed_raw in (None, ""):
+        feed_providers = False
+    else:
+        feed_providers = coerce_feed_providers(_value_of(feed_raw))
+
+    api_key = _optional_text(_value_of(fields.get("apiKey")))
+    if not api_key:
+        api_key = os.environ.get(ACCOUNT_KEY_ENV, "").strip()
+    if not api_key:
+        raise WorkflowError("apiKey is required")
+
+    return [
+        {
+            "client_fixture_id": pair["client_fixture_id"],
+            "FixtureId": pair["FixtureId"],
+            "apiKey": api_key,
+            "feedProviders": feed_providers,
+        }
+        for pair in pairs
+    ]
+
+
 def redacted_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
     hidden = redact(
         json.dumps({"apiKey": fields.get("apiKey", "")}),
@@ -198,6 +287,8 @@ def redacted_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
 
 def _base_url(env_name: str) -> str:
     value = os.environ.get(env_name, "").strip().rstrip("/")
+    if not value:
+        value = _DEFAULT_BASES.get(env_name, "")
     if not value:
         raise WorkflowError(f"{env_name} is not set")
     if not value.startswith("https://"):
@@ -449,44 +540,62 @@ def run_under_investigation(
     sleep: Callable[[float], None] | None = None,
     account_key: str | None = None,
 ) -> dict[str, Any]:
-    """Search, update the consumer fixture, set Live then Settled, and plan Jira."""
+    """Search, update each consumer fixture, set Live then Settled, and plan Jira."""
     _require_confirm(confirm, "Under investigation workflow")
-    fields = extract_custom_fields(issue, names)
-    search_term = consumer_search_term(fields["client_fixture_id"], fields["feedProviders"])
-    resolved = _search_resolved_id(search_term, search_fn)
-    update = update_consumer_fixture_id(
-        fields["FixtureId"],
-        resolved,
-        confirm=True,
-        http_get=http_get,
-    )
-    set_match_state(
-        fields["FixtureId"],
-        fields["apiKey"],
-        1,
-        confirm=True,
-        account_key=account_key,
-        http_post=http_post,
-    )
-    wait_seconds(3, sleep=sleep)
-    set_match_state(
-        fields["FixtureId"],
-        fields["apiKey"],
-        2,
-        confirm=True,
-        account_key=account_key,
-        http_post=http_post,
-    )
+    targets = issue_targets(issue, names)
+    planned: list[tuple[dict[str, Any], str, str]] = []
+    for fields in targets:
+        search_term = consumer_search_term(fields["client_fixture_id"], fields["feedProviders"])
+        resolved = _search_resolved_id(search_term, search_fn)
+        planned.append((fields, search_term, resolved))
+
+    fixture_results: list[dict[str, Any]] = []
+    for fields, search_term, resolved in planned:
+        update = update_consumer_fixture_id(
+            fields["FixtureId"],
+            resolved,
+            confirm=True,
+            http_get=http_get,
+        )
+        set_match_state(
+            fields["FixtureId"],
+            fields["apiKey"],
+            1,
+            confirm=True,
+            account_key=account_key,
+            http_post=http_post,
+        )
+        wait_seconds(3, sleep=sleep)
+        set_match_state(
+            fields["FixtureId"],
+            fields["apiKey"],
+            2,
+            confirm=True,
+            account_key=account_key,
+            http_post=http_post,
+        )
+        fixture_results.append(
+            {
+                "FixtureId": fields["FixtureId"],
+                "searchTerm": search_term,
+                "resolvedFixtureId": resolved,
+                "updateStatus": update.status,
+                "matchStates": [1, 2],
+                "fields": redacted_fields(fields),
+            }
+        )
     issue_key = _issue_key(issue)
+    first = fixture_results[0]
     return {
         "action": "resolved",
         "issue_key": issue_key,
-        "searchTerm": search_term,
-        "resolvedFixtureId": resolved,
-        "updateStatus": update.status,
-        "matchStates": [1, 2],
+        "searchTerm": first["searchTerm"],
+        "resolvedFixtureId": first["resolvedFixtureId"],
+        "updateStatus": first["updateStatus"],
+        "matchStates": first["matchStates"],
+        "fixtures": fixture_results,
         "jira": transition_jira_resolved(issue_key),
-        "fields": redacted_fields(fields),
+        "fields": first["fields"],
     }
 
 
