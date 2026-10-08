@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, urlsplit
 from picklebet_missing_ids.workflow import (
     ASSIGNEE_ID,
     AU_BASE_ENV,
+    DEFAULT_AU_BASE,
+    DEFAULT_INTERNAL_BASE,
     INTERNAL_BASE_ENV,
     ConfirmationRequired,
     SportcastError,
@@ -18,7 +20,9 @@ from picklebet_missing_ids.workflow import (
     analyze_reopen_comment,
     branch_for_status,
     consumer_search_term,
+    description_fixture_pairs,
     extract_custom_fields,
+    issue_targets,
     match_state_payload,
     redact,
     run_issue,
@@ -84,6 +88,66 @@ class SearchAndFieldsTest(unittest.TestCase):
         self.assertEqual(branch_for_status("Reopened"), "reopened")
         self.assertEqual(branch_for_status("In Progress"), "fallback")
 
+    def test_description_pairs_from_sgm_html(self) -> None:
+        description = (
+            "<p>Sportcast Fixture ID: 551738 <br>Client Fixture ID: sr:match:73220788<br>"
+            "Fixture Info: Martinique v El Salvador</p>"
+            "<p>Sportcast Fixture ID: 551736<br>Client Fixture ID: sr:match:73220786<br>"
+            "Fixture Info: Guatemala v Suriname</p>"
+        )
+        pairs = description_fixture_pairs(description)
+        self.assertEqual(
+            pairs,
+            [
+                {"FixtureId": 551738, "client_fixture_id": "sr:match:73220788"},
+                {"FixtureId": 551736, "client_fixture_id": "sr:match:73220786"},
+            ],
+        )
+
+    def test_description_targets_default_feed_providers_false(self) -> None:
+        previous = os.environ.get("SPORTCAST_ACCOUNT_KEY")
+        os.environ["SPORTCAST_ACCOUNT_KEY"] = ACCOUNT_KEY
+        try:
+            targets = issue_targets(
+                {
+                    "key": "TSD-389084",
+                    "fields": {
+                        "description": (
+                            "Sportcast Fixture ID: 551738 Client Fixture ID: sr:match:73220788"
+                        )
+                    },
+                }
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("SPORTCAST_ACCOUNT_KEY", None)
+            else:
+                os.environ["SPORTCAST_ACCOUNT_KEY"] = previous
+        self.assertEqual(len(targets), 1)
+        self.assertFalse(targets[0]["feedProviders"])
+        self.assertEqual(targets[0]["apiKey"], ACCOUNT_KEY)
+        self.assertEqual(consumer_search_term(targets[0]["client_fixture_id"], False), "sr:match:73220788")
+
+    def test_description_without_api_key_stops(self) -> None:
+        previous = os.environ.get("SPORTCAST_ACCOUNT_KEY")
+        os.environ.pop("SPORTCAST_ACCOUNT_KEY", None)
+        try:
+            with self.assertRaises(WorkflowError) as caught:
+                issue_targets(
+                    {
+                        "key": "TSD-389084",
+                        "fields": {
+                            "description": "Sportcast Fixture ID: 551738 Client Fixture ID: sr:match:73220788"
+                        },
+                    }
+                )
+        finally:
+            if previous is None:
+                os.environ.pop("SPORTCAST_ACCOUNT_KEY", None)
+            else:
+                os.environ["SPORTCAST_ACCOUNT_KEY"] = previous
+        self.assertIn("apiKey", str(caught.exception))
+
 
 class MutationGuardTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -114,14 +178,22 @@ class MutationGuardTest(unittest.TestCase):
         )
         self.assertNotIn(API_KEY, url)
 
-    def test_missing_base_url_names_the_env_var_only(self) -> None:
+    def test_missing_base_url_uses_automation_host(self) -> None:
         os.environ.pop(AU_BASE_ENV)
+        from picklebet_missing_ids.workflow import update_consumer_fixture_url
+
+        url = update_consumer_fixture_url(1, "abc")
+        self.assertTrue(url.startswith(DEFAULT_AU_BASE + "/api/UpdateConsumerFixtureid?"))
+        self.assertNotIn(API_KEY, url)
+
+    def test_non_https_base_is_rejected(self) -> None:
+        os.environ[AU_BASE_ENV] = "http://clusterau.sportcastlive.com"
         from picklebet_missing_ids.workflow import update_consumer_fixture_url
 
         with self.assertRaises(WorkflowError) as caught:
             update_consumer_fixture_url(1, "abc")
         self.assertIn(AU_BASE_ENV, str(caught.exception))
-        self.assertNotIn("https://", str(caught.exception))
+        self.assertNotIn("http://", str(caught.exception))
 
     def test_mutations_require_confirmation(self) -> None:
         with self.assertRaises(ConfirmationRequired):
@@ -224,11 +296,69 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn("PB-42", result["jira"]["comment"])
         self.assertEqual(result["fields"]["apiKey"], "[redacted]")
         self.assertEqual([event[0] for event in events], ["search", "get", "post", "sleep", "post"])
+        self.assertEqual(len(result["fixtures"]), 1)
         self.assertEqual(events[3], ("sleep", 3))
         self.assertEqual(events[2][1], 1)
         self.assertEqual(events[4][1], 2)
         self.assertEqual(events[2][2]["Key"], ACCOUNT_KEY)
         self.assertNotIn(API_KEY, json.dumps(result))
+
+    def test_two_description_fixtures_search_before_writes(self) -> None:
+        previous_account = os.environ.get("SPORTCAST_ACCOUNT_KEY")
+        os.environ["SPORTCAST_ACCOUNT_KEY"] = ACCOUNT_KEY
+        os.environ.pop(AU_BASE_ENV, None)
+        os.environ.pop(INTERNAL_BASE_ENV, None)
+        events: list[tuple] = []
+
+        def search(term: str) -> str:
+            events.append(("search", term))
+            return term
+
+        def http_get(url: str) -> int:
+            events.append(("get", url))
+            return 200
+
+        def http_post(url: str, body: dict) -> int:
+            events.append(("post", body["Items"][0]["MatchState"]))
+            return 200
+
+        issue = {
+            "key": "TSD-389084",
+            "fields": {
+                "description": (
+                    "Sportcast Fixture ID: 551738 Client Fixture ID: sr:match:73220788 "
+                    "Sportcast Fixture ID: 551736 Client Fixture ID: sr:match:73220786"
+                )
+            },
+        }
+        try:
+            result = run_issue(
+                issue,
+                status="Under investigation",
+                confirm=True,
+                search_fn=search,
+                http_get=http_get,
+                http_post=http_post,
+                sleep=lambda seconds: events.append(("sleep", seconds)),
+            )
+        finally:
+            if previous_account is None:
+                os.environ.pop("SPORTCAST_ACCOUNT_KEY", None)
+            else:
+                os.environ["SPORTCAST_ACCOUNT_KEY"] = previous_account
+
+        self.assertEqual(result["action"], "resolved")
+        self.assertEqual(
+            [event[0] for event in events],
+            ["search", "search", "get", "post", "sleep", "post", "get", "post", "sleep", "post"],
+        )
+        self.assertEqual(
+            [item["FixtureId"] for item in result["fixtures"]],
+            [551738, 551736],
+        )
+        self.assertNotIn(ACCOUNT_KEY, json.dumps(result))
+        self.assertTrue(events[2][1].startswith(DEFAULT_AU_BASE))
+        self.assertTrue(DEFAULT_INTERNAL_BASE.startswith("https://"))
 
     def test_feed_provider_true_searches_raw_client_id(self) -> None:
         seen = {}
@@ -305,13 +435,20 @@ class EndToEndTest(unittest.TestCase):
 
 
 class SourceSafetyTest(unittest.TestCase):
-    def test_skill_and_library_do_not_embed_url_hosts(self) -> None:
+    def test_skill_and_library_only_embed_automation_hosts(self) -> None:
         root = Path(__file__).resolve().parent
         skill = root.parent / ".cursor" / "skills" / "picklebet-missing-ids" / "SKILL.md"
-        for path in (root / "workflow.py", root / "__init__.py", skill):
+        agent = root.parent / ".cursor" / "agents" / "picklebet-missing-ids-agent.md"
+        allowed = (
+            "startswith",
+            "clusterau.sportcastlive.com",
+            "clusterinternal.sportcastlive.com",
+            "openbet.atlassian.net/jira/servicedesk/projects/TSD/settings/automate",
+        )
+        for path in (root / "workflow.py", root / "__init__.py", skill, agent):
             for line in path.read_text(encoding="utf-8").splitlines():
                 if "https://" in line or "http://" in line:
-                    self.assertIn("startswith", line, path.name)
+                    self.assertTrue(any(marker in line for marker in allowed), path.name + ": " + line)
 
 
 class RedactTest(unittest.TestCase):
