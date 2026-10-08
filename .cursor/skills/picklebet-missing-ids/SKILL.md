@@ -26,12 +26,21 @@ Read these from the environment or the Jira issue at runtime. Do not write them 
 
 | Name | Role |
 | --- | --- |
-| `SPORTCAST_AU_BASE` | HTTPS base for the consumer-fixture update |
-| `SPORTCAST_INTERNAL_BASE` | HTTPS base for match state |
+| `SPORTCAST_AU_BASE` | HTTPS base for the consumer-fixture update when the client region is `PROD_AU` |
+| `SPORTCAST_EU_BASE` | HTTPS base for the consumer-fixture update when the client region is `PROD_EU` |
+| `SPORTCAST_INTERNAL_BASE` | HTTPS base for `getclient` and match state |
 | `SPORTCAST_ACCOUNT_KEY` | Outer match-state `Key`, when it differs from the issue |
 | Issue field `apiKey` | Item `Key`, and the outer `Key` when the account env var is unset |
 
 If a base URL is unset, stop and say which variable is missing. Do not guess a host.
+
+## Region
+
+The consumer-fixture update host depends on the client's region, matching the TSD automation rule `019fa81d-054b-7a10-8437-d68eeb4e7d37`:
+
+1. `client_region(apiKey)` GETs `/api/getclient?key=…&Connections=true` on `SPORTCAST_INTERNAL_BASE` and reads `MessagingRegion` (trimmed, upper-cased).
+2. `region_base_url(region)` maps `PROD_AU` to `SPORTCAST_AU_BASE` and `PROD_EU` to `SPORTCAST_EU_BASE`.
+3. Any other region, or a missing `MessagingRegion`, stops the workflow with `unsupported MessagingRegion …` or `MessagingRegion is missing`. Do not fall back to another region.
 
 ## Fields
 
@@ -47,22 +56,23 @@ Pass the issue payload and, when the values sit on `customfield_*` ids, the id-t
 ## Branch: Under investigation
 
 1. `extract_custom_fields`.
-2. `consumer_search_term(client_fixture_id, feedProviders)`.
+2. `client_region(apiKey)`, then `region_base_url(region)`. Stop here on an unsupported region or a missing base URL.
+3. `consumer_search_term(client_fixture_id, feedProviders)`.
    - `feedProviders` true: the client fixture id itself.
    - `feedProviders` false: `sr:match:{client_fixture_id}` unless it already has that prefix.
-3. Search Sportcast with that term and take `resolvedFixtureId`. The sportcast MCP is the search path. On failure, widen the time window, drop filters, and try at most about three different searches. If search is still unavailable, stop. Do not invent a search URL.
-4. Require both `FixtureId` and `resolvedFixtureId` before any write.
-5. `update_consumer_fixture_id(FixtureId, resolvedFixtureId, confirm=True)`. This GETs `/api/UpdateConsumerFixtureid` and expects HTTP 200.
-6. `set_match_state(..., match_state=1, confirm=True)`.
-7. `wait_seconds(3)`.
-8. `set_match_state(..., match_state=2, confirm=True)`.
-9. Apply `transition_jira_resolved(issue_key)` through Jira:
+4. Search Sportcast with that term and take `resolvedFixtureId`. The sportcast MCP is the search path. On failure, widen the time window, drop filters, and try at most about three different searches. If search is still unavailable, stop. Do not invent a search URL.
+5. Require both `FixtureId` and `resolvedFixtureId` before any write.
+6. `update_consumer_fixture_id(FixtureId, resolvedFixtureId, region=region, confirm=True)`. This GETs `/api/UpdateConsumerFixtureid` on the region's base and expects HTTP 200.
+7. `set_match_state(..., match_state=1, confirm=True)`.
+8. `wait_seconds(3)`.
+9. `set_match_state(..., match_state=2, confirm=True)`.
+10. Apply `transition_jira_resolved(issue_key)` through Jira:
    - Incident Resolution = `Workaround Applied`
    - Resolving Team = `Sportsbook Support`
    - Comment: `Thanks for raising {issue_key}. Please check . If the issue persists please reopen the ticket.`
    - Transition to Resolved.
 
-`run_issue(..., status="Under investigation", confirm=True, search_fn=...)` performs steps 1–9's plan, including the three-second wait between match states. Applying the returned `jira` plan still goes through the Jira MCP.
+`run_issue(..., status="Under investigation", confirm=True, search_fn=...)` performs steps 1–10's plan, including the three-second wait between match states. Applying the returned `jira` plan still goes through the Jira MCP.
 
 Network errors retry once. Any other failure is logged without secrets and stops the write path.
 

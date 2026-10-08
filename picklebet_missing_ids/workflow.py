@@ -26,11 +26,18 @@ RESOLVED_COMMENT = (
 REOPEN_OK_COMMENT = "Resolving"
 
 AU_BASE_ENV = "SPORTCAST_AU_BASE"
+EU_BASE_ENV = "SPORTCAST_EU_BASE"
 INTERNAL_BASE_ENV = "SPORTCAST_INTERNAL_BASE"
 ACCOUNT_KEY_ENV = "SPORTCAST_ACCOUNT_KEY"
 
+REGION_BASE_ENVS = {
+    "PROD_AU": AU_BASE_ENV,
+    "PROD_EU": EU_BASE_ENV,
+}
+
 UPDATE_PATH = "/api/UpdateConsumerFixtureid"
 MATCH_STATE_PATH = "/api/AddOrUpdateFixtureMatchStateList"
+GET_CLIENT_PATH = "/api/getclient"
 
 _PERSIST_MARKERS = (
     "still",
@@ -205,7 +212,39 @@ def _base_url(env_name: str) -> str:
     return value
 
 
-def update_consumer_fixture_url(fixture_id: Any, consumer_fixture_id: Any) -> str:
+def normalize_region(value: Any) -> str:
+    text = "" if value is None else str(value).strip().upper()
+    if not text:
+        raise WorkflowError("MessagingRegion is missing")
+    if not re.fullmatch(r"[A-Z0-9_]+", text):
+        raise WorkflowError("MessagingRegion has an unexpected shape")
+    return text
+
+
+def region_base_url(region: Any) -> str:
+    """Return the configured base URL for a client MessagingRegion."""
+    normalized = normalize_region(region)
+    env_name = REGION_BASE_ENVS.get(normalized)
+    if env_name is None:
+        supported = ", ".join(sorted(REGION_BASE_ENVS))
+        raise WorkflowError(
+            f"unsupported MessagingRegion {normalized}; expected one of {supported}"
+        )
+    return _base_url(env_name)
+
+
+def get_client_url(api_key: str) -> str:
+    key = _require_text(api_key, "apiKey")
+    query = urlencode({"key": key, "Connections": "true"})
+    return f"{_base_url(INTERNAL_BASE_ENV)}{GET_CLIENT_PATH}?{query}"
+
+
+def update_consumer_fixture_url(
+    fixture_id: Any,
+    consumer_fixture_id: Any,
+    *,
+    region: Any,
+) -> str:
     fixture = _coerce_fixture_id(fixture_id)
     consumer = _coerce_consumer_id(consumer_fixture_id)
     query = urlencode(
@@ -214,7 +253,7 @@ def update_consumer_fixture_url(fixture_id: Any, consumer_fixture_id: Any) -> st
             "consumerfixtureid": consumer,
         }
     )
-    return f"{_base_url(AU_BASE_ENV)}{UPDATE_PATH}?{query}"
+    return f"{region_base_url(region)}{UPDATE_PATH}?{query}"
 
 
 def match_state_payload(
@@ -284,30 +323,64 @@ def _ensure_ok(response: _Response, secrets: list[str], action: str) -> _Respons
     return response
 
 
+def _as_response(result: Any) -> _Response:
+    if isinstance(result, _Response):
+        return result
+    if isinstance(result, int):
+        return _Response(result, "")
+    status = int(getattr(result, "status", result))
+    body = getattr(result, "body", "")
+    if not isinstance(body, str):
+        body = json.dumps(body)
+    return _Response(status, body)
+
+
+def client_region(
+    api_key: str,
+    *,
+    http_get: Callable[[str], Any] | None = None,
+) -> str:
+    """Read the client's MessagingRegion from getclient. Read-only."""
+    key = _require_text(api_key, "apiKey")
+    url = get_client_url(key)
+    secrets = [key]
+
+    def once() -> _Response:
+        if http_get is None:
+            return _default_request("GET", url, None, secrets)
+        return _as_response(http_get(url))
+
+    try:
+        response = _ensure_ok(_with_network_retry(once), secrets, "getclient")
+    except ConnectionError as exc:
+        raise SportcastError(redact(str(exc), secrets)) from None
+    try:
+        body = json.loads(response.body or "")
+    except ValueError:
+        raise SportcastError("getclient returned a body that is not JSON") from None
+    if not isinstance(body, Mapping):
+        raise SportcastError("getclient returned an unexpected body")
+    return normalize_region(body.get("MessagingRegion"))
+
+
 def update_consumer_fixture_id(
     fixture_id: Any,
     consumer_fixture_id: Any,
     *,
+    region: Any,
     confirm: bool = False,
     http_get: Callable[[str], Any] | None = None,
 ) -> _Response:
-    """GET the consumer-fixture update endpoint. Requires confirm=True."""
+    """GET the consumer-fixture update endpoint for a region. Requires confirm=True."""
     _require_confirm(confirm, "UpdateConsumerFixtureid")
     fixture = _coerce_fixture_id(fixture_id)
     consumer = _coerce_consumer_id(consumer_fixture_id)
-    url = update_consumer_fixture_url(fixture, consumer)
+    url = update_consumer_fixture_url(fixture, consumer, region=region)
 
     def once() -> _Response:
         if http_get is None:
             return _default_request("GET", url, None, [])
-        result = http_get(url)
-        if isinstance(result, _Response):
-            return result
-        if isinstance(result, int):
-            return _Response(result, "")
-        status = int(getattr(result, "status", result))
-        body = str(getattr(result, "body", ""))
-        return _Response(status, body)
+        return _as_response(http_get(url))
 
     return _ensure_ok(_with_network_retry(once), [], "UpdateConsumerFixtureid")
 
@@ -330,14 +403,7 @@ def set_match_state(
     def once() -> _Response:
         if http_post is None:
             return _default_request("POST", url, payload, secrets)
-        result = http_post(url, payload)
-        if isinstance(result, _Response):
-            return result
-        if isinstance(result, int):
-            return _Response(result, "")
-        status = int(getattr(result, "status", result))
-        body = str(getattr(result, "body", ""))
-        return _Response(status, body)
+        return _as_response(http_post(url, payload))
 
     try:
         response = _ensure_ok(_with_network_retry(once), secrets, "AddOrUpdateFixtureMatchStateList")
@@ -449,14 +515,18 @@ def run_under_investigation(
     sleep: Callable[[float], None] | None = None,
     account_key: str | None = None,
 ) -> dict[str, Any]:
-    """Search, update the consumer fixture, set Live then Settled, and plan Jira."""
+    """Resolve the region, search, update, set Live then Settled, and plan Jira."""
     _require_confirm(confirm, "Under investigation workflow")
     fields = extract_custom_fields(issue, names)
+    region = client_region(fields["apiKey"], http_get=http_get)
+    # Stop on an unsupported region or a missing base URL before searching.
+    region_base_url(region)
     search_term = consumer_search_term(fields["client_fixture_id"], fields["feedProviders"])
     resolved = _search_resolved_id(search_term, search_fn)
     update = update_consumer_fixture_id(
         fields["FixtureId"],
         resolved,
+        region=region,
         confirm=True,
         http_get=http_get,
     )
@@ -481,6 +551,7 @@ def run_under_investigation(
     return {
         "action": "resolved",
         "issue_key": issue_key,
+        "region": region,
         "searchTerm": search_term,
         "resolvedFixtureId": resolved,
         "updateStatus": update.status,
